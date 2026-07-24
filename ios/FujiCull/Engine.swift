@@ -35,6 +35,18 @@ final class Engine: ObservableObject {
     private var remoteBase: URL?
     private(set) var apiKey: String = ""
     private var remoteAuthValidated = false
+    private var remoteFailStreak = 0
+    // A DEDICATED session for the health/reachability poll, with its own
+    // connection pool separate from URLSession.shared (which the thumbnail flood
+    // uses). Otherwise a fast scrubber fling saturates the shared pool, the tiny
+    // health poll times out, and the app wrongly drops to the connect screen.
+    private let controlSession: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 8
+        c.httpMaximumConnectionsPerHost = 2
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: c)
+    }()
 
     /// The fake corpus exists so the app is buildable/testable without a camera.
     /// On real hardware it is never entered automatically — culling a synthetic
@@ -198,6 +210,7 @@ final class Engine: ObservableObject {
         remoteBase = url
         apiKey = settings.remoteKey.trimmingCharacters(in: .whitespaces)
         remoteAuthValidated = false
+        remoteFailStreak = 0
         mode = .remote
         ready = false
         status = "connecting to \(url.host ?? "server")…"
@@ -219,23 +232,31 @@ final class Engine: ObservableObject {
     private func pollRemote() async {
         guard let base = remoteBase else { return }
         let host = base.host ?? "server"
-        // liveness + readiness via the open /api/health
+        // liveness + readiness via the open /api/health, on the dedicated pool
         var hreq = URLRequest(url: base.appendingPathComponent("api/health"))
-        hreq.timeoutInterval = 5
-        guard let (data, resp) = try? await URLSession.shared.data(for: hreq),
+        hreq.timeoutInterval = 8
+        guard let (data, resp) = try? await controlSession.data(for: hreq),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let h = try? JSONDecoder().decode(RemoteHealth.self, from: data) else {
-            if ready { ready = false }
-            let s = "reconnecting to \(host)…"; if status != s { status = s }
+            // Tolerate transient blips: a heavy scrubber fling can briefly
+            // saturate the link. Only fall back to the connect screen after
+            // several CONSECUTIVE failures, and once ready never demote on a
+            // single miss — the grid stays put through a hiccup.
+            remoteFailStreak += 1
+            if remoteFailStreak >= 4 {
+                if ready { ready = false }
+                let s = "reconnecting to \(host)…"; if status != s { status = s }
+            }
             return
         }
+        remoteFailStreak = 0
         // validate the key once against a gated endpoint so a wrong key is
         // surfaced clearly instead of an empty grid
         if h.authRequired, !remoteAuthValidated {
             var areq = URLRequest(url: base.appendingPathComponent("api/status"))
-            areq.timeoutInterval = 5
+            areq.timeoutInterval = 8
             if !apiKey.isEmpty { areq.setValue(apiKey, forHTTPHeaderField: "x-api-key") }
-            let code = (try? await URLSession.shared.data(for: areq)).map { ($0.1 as? HTTPURLResponse)?.statusCode ?? 0 }
+            let code = (try? await controlSession.data(for: areq)).map { ($0.1 as? HTTPURLResponse)?.statusCode ?? 0 }
             if code == 401 {
                 if ready { ready = false }
                 let s = "wrong key for \(host)"; if status != s { status = s }
