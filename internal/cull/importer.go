@@ -311,7 +311,20 @@ func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile, onFil
 			}
 			ctx, cancel := context.WithTimeout(context.Background(),
 				60*time.Second+time.Duration(len(items))*15*time.Second)
-			fetchErr := app.backend.Fetch(ctx, items)
+			// Ride the persistent partial-read session when there is one —
+			// the same path browsing uses. A one-shot aft per chunk is what
+			// trips this camera into replaying stale buffers, which is why an
+			// import could fail on a card that browsed perfectly.
+			var fetchErr error
+			if app.prefetch.partsOK() {
+				sizes := make([]int64, len(chunk))
+				for i, c := range chunk {
+					sizes[i] = c.size
+				}
+				fetchErr = app.prefetch.fetchItemsViaParts(ctx, items, sizes)
+			} else {
+				fetchErr = app.backend.Fetch(ctx, items)
+			}
 			cancel()
 			if fetchErr != nil {
 				log.Printf("import: chunk of %d: %v", len(items), fetchErr)
