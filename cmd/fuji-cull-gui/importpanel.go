@@ -47,8 +47,8 @@ func (u *ui) drawImportPanel() {
 		if active {
 			shown += "_"
 		}
-		u.text(u.fontSm, shown, colFG, r.X+8, r.Y+5, false)
-		y += 38
+		u.text(u.fontSm, shown, colFG, r.X+sc(8), r.Y+sc(5), false)
+		y += sc(38)
 	}
 	field("destination directory (Tab switches fields)", u.impDest, u.impField == 0)
 	field("immich album (optional)", u.impAlbum, u.impField == 1)
@@ -60,8 +60,8 @@ func (u *ui) drawImportPanel() {
 			label += " — finished"
 		}
 		u.text(u.fontSm, fmt.Sprintf("%s   %d / %d", label, st.Done, st.Total), colAmber, box.X+sc(24), y, false)
-		y += 22
-		bar := sdl.Rect{X: box.X + sc(24), Y: y, W: pw - sc(48), H: 8}
+		y += sc(22)
+		bar := sdl.Rect{X: box.X + sc(24), Y: y, W: pw - sc(48), H: sc(8)}
 		u.fillRect(bar, colBG)
 		if st.Total > 0 {
 			fill := bar
@@ -74,7 +74,7 @@ func (u *ui) drawImportPanel() {
 			y += sc(20)
 		}
 	}
-	u.text(u.fontSm, "Enter start import    Esc close", colDim, box.X+sc(24), box.Y+ph-30, false)
+	u.text(u.fontSm, "Enter start import    Esc close", colDim, box.X+sc(24), box.Y+ph-sc(30), false)
 }
 
 func (u *ui) importKey(e *sdl.KeyboardEvent) {
