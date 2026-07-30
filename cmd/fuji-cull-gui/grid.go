@@ -164,7 +164,7 @@ func (u *ui) drawGrid() {
 
 	u.drawScrubber(w, h, top, viewH, maxScroll)
 
-	u.text(u.fontSm, fmt.Sprintf("GRID  %d/%d   T/Esc close   Enter open   [ ] cols   PgUp/Dn day   Ctrl+R rescan   W/K keep   S/X reject",
+	u.text(u.fontSm, fmt.Sprintf("GRID  %d/%d   T/Esc close   Enter open   [ ] cols   PgUp/Dn day   Ctrl+R rescan   W/K keep   S/X reject   ⌘, settings",
 		u.cursor+1, len(u.shots)), colDim, w/2, h-sc(16), true)
 }
 

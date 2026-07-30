@@ -241,6 +241,16 @@ type ui struct {
 	peaking   bool            // focus-peaking overlay on/off (toggled with F)
 	focusBest map[string]bool // shots that won their burst on focus score
 
+	// settings panel editing state (see settings.go)
+	setURL, setKey, setAlbum string
+	setStack                 bool
+	setField                 int
+	setSaved                 bool
+	setOpenTs                uint32
+	setPrevMode              int      // where Esc returns to
+	cogRect                  sdl.Rect // header settings button, hit-tested on click
+	mouseX, mouseY           int32    // last cursor position, for hover feedback
+
 	// viewer transform (CSS-pixel semantics like the web UI)
 	scale, tx, ty float64
 	fit           float64
@@ -262,7 +272,7 @@ type ui struct {
 	lastWinW    int32
 	lastWinH    int32
 
-	mode int // modeViewer | modeGrid | modeImport
+	mode int // modeViewer | modeGrid | modeImport | modeSettings
 
 	mpv        videoPlayer
 	glVideo    bool           // GL render path available (zero-copy hwdec)
@@ -301,6 +311,7 @@ const (
 	modeViewer = iota
 	modeGrid
 	modeImport
+	modeSettings
 )
 
 // All layout happens in physical drawable pixels. dpr is the drawable/window
@@ -616,6 +627,18 @@ func (u *ui) frame() bool {
 			u.drawHeader()
 			u.drawStrip()
 			u.drawImportPanel()
+		case modeSettings:
+			// keep whatever you opened it from underneath, so closing the
+			// panel puts you back exactly where you were
+			if u.setPrevMode == modeGrid {
+				u.drawGrid()
+				u.drawHeader()
+			} else {
+				u.drawViewer()
+				u.drawHeader()
+				u.drawStrip()
+			}
+			u.drawSettings()
 		default:
 			u.drawViewer()
 			u.drawHeader()
@@ -850,6 +873,7 @@ func (u *ui) zoomAt(px, py float64, newScale float64) {
 func (u *ui) drawHeader() {
 	w, _ := u.outSize()
 	u.fillRect(sdl.Rect{X: 0, Y: 0, W: w, H: sc(38)}, colPanel)
+	u.drawCog(w-sc(22), sc(19), sc(7))
 	s := u.shots[u.cursor]
 	u.text(u.font, fmt.Sprintf("%04d/%04d", u.cursor+1, len(u.shots)), colFG, sc(14), sc(10), false)
 	name := fmt.Sprintf("%s / %s", s.Folder, s.Base)
@@ -962,7 +986,7 @@ func (u *ui) drawStrip() {
 			u.ren.DrawRect(&out)
 		}
 	}
-	u.text(u.fontSm, "A/D ←→ nav   W/K keep   S/X reject   E/C clear   U undo   G next   T grid   I import   L video   Z 1:1   Space pause   ,/. seek   Ctrl+Q quit", colDim, w/2, h-sc(16), true)
+	u.text(u.fontSm, "A/D ←→ nav   W/K keep   S/X reject   E/C clear   U undo   G next   T grid   I import   F peaking   L video   Z 1:1   Space pause   ,/. seek   ⌘, settings   Ctrl+Q quit", colDim, w/2, h-sc(16), true)
 }
 
 func coverSrc(tw, th, dw, dh int32) sdl.Rect {
@@ -1067,6 +1091,13 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 				u.importText(e.GetText())
 			}
 		}
+		if u.mode == modeSettings {
+			// same trick: the comma that opened the panel would otherwise be
+			// typed straight into the URL field
+			if e.Timestamp-u.setOpenTs > 20 {
+				u.settingsText(e.GetText())
+			}
+		}
 		return true
 	case *sdl.KeyboardEvent:
 		if e.Type != sdl.KEYDOWN || u.shots == nil {
@@ -1074,6 +1105,10 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 		}
 		if u.mode == modeImport {
 			u.importKey(e)
+			return true
+		}
+		if u.mode == modeSettings {
+			u.settingsKey(e)
 			return true
 		}
 		if u.mode == modeGrid {
@@ -1187,7 +1222,11 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 			delete(u.pool.done, s.ID)
 			u.pool.mu.Unlock()
 		case sdl.K_COMMA:
-			if u.mpv != nil && u.videoID != "" {
+			// Cmd+, is Preferences on macOS; bare comma stays video seek.
+			if e.Keysym.Mod&sdl.KMOD_GUI != 0 {
+				u.openSettings()
+				u.setOpenTs = e.Timestamp
+			} else if u.mpv != nil && u.videoID != "" {
 				u.mpv.Seek(-5)
 			}
 		case sdl.K_PERIOD:
@@ -1237,6 +1276,16 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 		if e.Button == sdl.BUTTON_LEFT && u.shots != nil {
 			if e.Type == sdl.MOUSEBUTTONDOWN {
 				mx, my := int32(float64(e.X)*dpr+0.5), int32(float64(e.Y)*dpr+0.5)
+				if ptIn(u.cogRect, mx, my) {
+					// clicking it again closes, like any toggle button
+					if u.mode == modeSettings {
+						u.mode = u.setPrevMode
+						sdl.StopTextInput()
+					} else {
+						u.openSettings()
+					}
+					return true
+				}
 				if u.mode == modeGrid {
 					if u.scrubHit(mx) {
 						u.scrubDrag = true
@@ -1280,6 +1329,7 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 			}
 		}
 	case *sdl.MouseMotionEvent:
+		u.mouseX, u.mouseY = int32(float64(e.X)*dpr+0.5), int32(float64(e.Y)*dpr+0.5)
 		if u.scrubDrag {
 			u.scrubTo(int32(float64(e.Y)*dpr + 0.5))
 			return true
