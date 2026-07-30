@@ -35,6 +35,10 @@ data class Settings(
     val album: String = "",
     val syncUrl: String = "",
     val syncKey: String = "",
+    // Remote camera host: browse a camera plugged into another machine instead
+    // of this phone. Empty = use this device's camera.
+    val remoteUrl: String = "",
+    val remoteKey: String = "",
 )
 
 class MainActivity : ComponentActivity() {
@@ -179,6 +183,8 @@ class MainActivity : ComponentActivity() {
             album = it.getString("album", "") ?: "",
             syncUrl = it.getString("syncUrl", "") ?: "",
             syncKey = it.getString("syncKey", "") ?: "",
+            remoteUrl = it.getString("remoteUrl", "") ?: "",
+            remoteKey = it.getString("remoteKey", "") ?: "",
         )
     }
 
@@ -191,6 +197,8 @@ class MainActivity : ComponentActivity() {
             .putString("album", s.album)
             .putString("syncUrl", s.syncUrl.trim().trimEnd('/'))
             .putString("syncKey", s.syncKey.trim())
+            .putString("remoteUrl", s.remoteUrl.trim().trimEnd('/'))
+            .putString("remoteKey", s.remoteKey.trim())
             .apply()
     }
 

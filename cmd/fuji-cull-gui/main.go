@@ -393,6 +393,7 @@ func main() {
 	flag.IntVar(&o.HashConc, "hash-concurrency", 4, "parallel hashing")
 	flag.StringVar(&o.SyncURL, "sync-url", os.Getenv("FUJI_SYNC_URL"), "cross-device sync server URL (or env FUJI_SYNC_URL)")
 	flag.StringVar(&o.SyncKey, "sync-key", os.Getenv("FUJI_SYNC_KEY"), "cross-device sync API key (or env FUJI_SYNC_KEY)")
+	flag.StringVar(&o.EngineKey, "engine-key", os.Getenv("FUJI_ENGINE_KEY"), "require this key on /api/* to expose the engine on the LAN (or env FUJI_ENGINE_KEY)")
 	decodeAhead := flag.Int("decode-ahead", 28, "decoded frames to hold ahead of the cursor (~104 MB RAM each)")
 	decodeBehind := flag.Int("decode-behind", 8, "decoded frames to hold behind the cursor")
 	flag.Parse()
