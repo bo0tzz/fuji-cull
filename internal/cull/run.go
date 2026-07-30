@@ -63,8 +63,23 @@ func Start(o Options) (*App, http.Handler, error) {
 	if err := exif.EnsurePath(); err != nil {
 		return nil, nil, err
 	}
+	// Credentials saved in the app fill in whatever flags/env didn't supply.
+	// This has to happen BEFORE SkipImmich is derived, or a Finder launch —
+	// which inherits no shell environment — would disable Immich despite
+	// having perfectly good credentials on disk.
+	if saved := loadImportDefaults(); true {
+		if o.ImmichURL == "" {
+			o.ImmichURL = saved.ImmichURL
+		}
+		if o.ImmichKey == "" {
+			o.ImmichKey = saved.ImmichKey
+		}
+		if !o.ImmichStack {
+			o.ImmichStack = saved.ImmichStack
+		}
+	}
 	if !o.SkipImmich && (o.ImmichURL == "" || o.ImmichKey == "") {
-		log.Printf("WARN: Immich URL/key not configured; imports will only copy to the destination (--skip-immich implied)")
+		log.Printf("WARN: Immich URL/key not configured; imports will only copy to the destination (set them in settings, or --immich-url/--immich-key)")
 		o.SkipImmich = true
 	}
 	// Sync + engine-key config also arrive via env (mobile sets them with

@@ -3,8 +3,10 @@ package cull
 import (
 	"context"
 	"os"
+	"strings"
 
 	"github.com/zack/fuji-tools/internal/photo"
+	"github.com/zack/fuji-tools/internal/pipeline"
 )
 
 // GUI-facing accessors: the native frontend runs in-process with the same
@@ -127,6 +129,43 @@ func (a *App) ImmichStates() string {
 // CameraSick reports tripped camera-transfer circuit breakers (the X-H2S
 // stale-buffer bug); a power cycle is the only remedy.
 func (a *App) CameraSick() (bulk, partial bool) { return a.prefetch.LinkSick() }
+
+// pipeline returns the import pipeline options under the lock. Settings can be
+// edited while the app runs, so this must not be read as a bare field.
+func (a *App) pipeline() pipeline.Options {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.pipelineOpts
+}
+
+// ImmichSettings reports the current credentials for display. `active` is
+// false when imports would be disk-only.
+func (a *App) ImmichSettings() (url, key, album string, stack, active bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	o := a.pipelineOpts
+	return o.ImmichURL, o.ImmichKey, a.album, o.ImmichStack, !o.SkipImmich
+}
+
+// SetImmich applies credentials entered in the app and persists them. Imports
+// pick them up immediately — the pipeline reads its options per run.
+//
+// The "already on the server" badge sweep is built once at startup, so
+// switching Immich ON here does not begin back-filling those badges until the
+// next launch; imports themselves work right away.
+func (a *App) SetImmich(url, key, album string, stack bool) {
+	url = strings.TrimRight(strings.TrimSpace(url), "/")
+	key = strings.TrimSpace(key)
+	a.mu.Lock()
+	a.pipelineOpts.ImmichURL = url
+	a.pipelineOpts.ImmichKey = key
+	a.pipelineOpts.ImmichStack = stack
+	// Credentials are what decide whether an import can upload at all.
+	a.pipelineOpts.SkipImmich = url == "" || key == ""
+	a.album = album
+	a.mu.Unlock()
+	saveImmichDefaults(url, key, album, stack)
+}
 
 // FocusBest reports which shots are the sharpest frame of their burst, keyed by
 // shot ID for direct lookup while drawing. Only bursts (2+ frames captured
