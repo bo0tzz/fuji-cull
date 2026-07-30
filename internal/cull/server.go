@@ -7,10 +7,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/zack/fuji-tools/internal/photo"
 	"github.com/zack/fuji-tools/internal/pipeline"
 )
 
@@ -214,10 +216,41 @@ func (a *App) handler() http.Handler {
 
 	mux.HandleFunc("GET /api/image", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
+		// max= asks for a downscaled copy sized to the client's screen: ~4x
+		// fewer bytes and a much cheaper decode, which is what makes buffering
+		// ahead keep up with a swipe. Any failure below falls through to the
+		// full frame, so this only ever costs speed, never the image.
+		size := 0
+		if v := r.URL.Query().Get("max"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				size = previewSize(n)
+			}
+		}
+		var shot *photo.Shot
+		if size > 0 {
+			shot = a.catalog.Get(id)
+			// A cached preview answers without waiting on the full frame —
+			// and so without touching the camera.
+			if shot != nil {
+				if hit := a.prefetch.CachedPreview(shot, size); hit != "" {
+					w.Header().Set("Cache-Control", "private, max-age=604800, immutable")
+					w.Header().Set("Content-Type", "image/jpeg")
+					http.ServeFile(w, r, hit)
+					return
+				}
+			}
+		}
 		path, err := a.prefetch.Wait(r.Context(), id)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+		if size > 0 && shot != nil {
+			if pp, err := a.prefetch.PreviewPath(shot, path, size); err == nil {
+				path = pp
+			} else {
+				log.Printf("preview: %s @%d: %v (serving full frame)", id, size, err)
+			}
 		}
 		// The bytes for a given shot never change: let the browser cache them
 		// so re-visiting a shot works even after the server evicts its copy.
@@ -330,6 +363,17 @@ func (a *App) handler() http.Handler {
 		states, have := a.prefetch.ThumbStates()
 		writeJSON(w, map[string]any{"states": states, "have": have,
 			"orient": a.prefetch.OrientStates(), "immich": a.ImmichStates()})
+	})
+
+	// Focus scores, separate from /api/thumbs because that one is polled hard
+	// while the thumbnail sweep runs and this map only creeps forward.
+	mux.HandleFunc("GET /api/sharpness", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{
+			"scores": a.prefetch.Sharpness(),
+			// the sharpest frame of each burst — the only focus comparison
+			// that means anything (see BurstBest)
+			"best": a.prefetch.BurstBest(),
+		})
 	})
 
 	mux.HandleFunc("POST /api/thumbhint", func(w http.ResponseWriter, r *http.Request) {

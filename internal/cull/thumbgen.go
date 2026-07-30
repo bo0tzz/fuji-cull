@@ -157,6 +157,10 @@ func (p *Prefetcher) generateThumbFrom(s *photo.Shot, srcPath string) error {
 	if err != nil {
 		return err
 	}
+	// Same bargain as preview generation: the decode is already paid for, and
+	// this is the full frame, so the score is measured on real detail.
+	p.scoreDecoded(s, src)
+
 	b := src.Bounds()
 	w := 240
 	h := b.Dy() * w / b.Dx()

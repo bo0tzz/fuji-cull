@@ -128,6 +128,22 @@ func (a *App) ImmichStates() string {
 // stale-buffer bug); a power cycle is the only remedy.
 func (a *App) CameraSick() (bulk, partial bool) { return a.prefetch.LinkSick() }
 
+// FocusBest reports which shots are the sharpest frame of their burst, keyed by
+// shot ID for direct lookup while drawing. Only bursts (2+ frames captured
+// within a couple of seconds) are ever marked — see Prefetcher.BurstBest for
+// why comparing focus scores across scenes would be meaningless.
+func (a *App) FocusBest() map[string]bool {
+	if !a.isReady() {
+		return nil
+	}
+	ids := a.prefetch.BurstBest()
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
 // CanStreamVideo reports whether the shot's video can play by streaming
 // straight off the camera (no full pull). False during imports — the import
 // owns the link for minutes and a stream session would fight it.

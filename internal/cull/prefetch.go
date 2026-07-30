@@ -77,6 +77,10 @@ type Prefetcher struct {
 
 	orient      map[string]uint8 // shot ID -> EXIF orientation (absent = unknown)
 	orientDirty bool
+	sharp       map[string]float64 // shot ID -> focus score (absent = unmeasured)
+	sharpDirty  bool
+	taken       map[string]int64 // shot ID -> EXIF capture time (unix); groups bursts
+	takenDirty  bool
 	healTried   map[string]bool // camera-impossible shots already head-healed (or attempted)
 	imageTurn   bool            // last non-demand cycle was a window fill; heads go next
 
@@ -155,6 +159,8 @@ func newPrefetcher(cat *Catalog, backend Backend, cacheDir string, ahead, behind
 		thumbStalls: map[string]int{},
 		thumbRank:   map[string]int{},
 		orient:      map[string]uint8{},
+		sharp:       map[string]float64{},
+		taken:       map[string]int64{},
 		healTried:   map[string]bool{},
 	}
 	p.cond = sync.NewCond(&p.mu)
@@ -266,9 +272,17 @@ func newPrefetcher(cat *Catalog, backend Backend, cacheDir string, ahead, behind
 	if purged > 0 {
 		log.Printf("prefetch: purged %d stale-buffer garbage files banked by a previous run", purged)
 	}
+	// Load every persisted store BEFORE starting anything that touches them:
+	// backfillOrient harvests capture times into p.taken, so launching it
+	// ahead of loadTaken raced a locked writer against an unlocked one and
+	// killed the process with "concurrent map writes" on startup.
 	p.loadOrient()
+	p.loadSharp()
+	p.loadTaken()
 	go p.orientFlusher()
 	go p.backfillOrient()
+	go p.sharpFlusher()
+	go p.sharpSweep()
 	go p.streamJanitor()
 	return p, nil
 }
@@ -1582,6 +1596,7 @@ func (p *Prefetcher) evictLocked() {
 			s := p.cat.Shots[i]
 			_ = os.Remove(p.displayPath(s))
 			_ = os.Remove(p.rafPath(s))
+			p.removePreviews(s)
 			delete(p.state, id)
 		}
 	}
