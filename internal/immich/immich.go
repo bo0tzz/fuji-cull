@@ -103,6 +103,15 @@ func (c *Client) Upload(ctx context.Context, f *photo.FileEntry) (string, bool, 
 		return "", false, err
 	}
 	req.Header.Set("Content-Type", contentType)
+	// Hand the server the SHA-1 we computed from the bytes on disk, so it can
+	// check what it received against what we sent instead of taking the
+	// transfer on trust. It also lets Immich recognise an asset it already has
+	// before storing the body again. Base64 is the same encoding the
+	// bulk-upload-check path already uses successfully against the same
+	// server; a 28-character SHA-1 is unambiguous.
+	if f.SHA1B64 != "" {
+		req.Header.Set("x-immich-checksum", f.SHA1B64)
+	}
 	req.ContentLength = -1 // unknown; transferred chunked
 
 	resp, err := c.do(req)
