@@ -24,6 +24,23 @@ Keys: `←→` navigate · `K` keep · `X` reject · `C` clear · `U` undo ·
 `Z`/click 100% zoom · `G` next undecided · `L` load video · `R` retry ·
 `I` import.
 
+Immich credentials can also be entered in the app — `⌘,` (or the cog in the
+header) on macOS, Settings on iOS/Android — and are stored in
+`~/.local/share/fuji-cull/import-defaults.json` (mode `0600`). This matters on
+macOS: an app launched from Finder inherits no shell environment, so
+`IMMICH_URL`/`IMMICH_API_KEY` exported in your shell are invisible to it.
+
+**API key permissions.** Create the key in Immich with:
+
+| Permission | Needed for |
+| --- | --- |
+| `asset.upload` | always — the upload itself and the bulk-upload-check that detects shots already on the server |
+| `album.read`, `album.create`, `albumAsset.create` | only when importing into an album |
+| `stack.create` | only with RAF+JPG stacking enabled |
+
+An under-scoped key still saves fine and only fails at import time, so it is
+worth ticking these when you create it.
+
 Decisions persist per `--session`, so a disconnect or restart resumes where
 you left off. Use `--listen 0.0.0.0:8787` to cull from another device.
 `--backend dir --root <dir>` works against any local directory with
