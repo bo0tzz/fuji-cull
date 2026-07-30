@@ -15,6 +15,7 @@ struct SettingsView: View {
     // UI-only preference: applies immediately, no engine restart (unlike the
     // draft fields, which are saved and restart the camera link).
     @AppStorage("viewerAnimations") private var viewerAnimations = false
+    @AppStorage("focusPeaking") private var focusPeaking = false
 
     var body: some View {
         NavigationStack {
@@ -54,10 +55,11 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Animate photo transitions", isOn: $viewerAnimations)
+                    Toggle("Focus peaking overlay", isOn: $focusPeaking)
                 } header: {
                     Text("Viewer")
                 } footer: {
-                    Text("Off cuts instantly between photos so you can compare frames in a burst. On slides each page in. Applies immediately.")
+                    Text("Animation off cuts instantly between photos so you can compare frames in a burst. On slides each page in.\n\nFocus peaking paints the in-focus edges of the frame — tap the ◈ button in the viewer, or press F, to flick it on and off. Zoomed in it measures the original file, so it shows true critical focus.")
                 }
 
                 Section {

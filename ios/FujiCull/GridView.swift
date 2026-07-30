@@ -54,6 +54,10 @@ final class GridModel: ObservableObject {
     // paging, and only a timeline tap / KEEP / REJECT moves to the next shot.
     @Published var viewerZoomed = false
     func setViewerZoomed(_ v: Bool) { if viewerZoomed != v { viewerZoomed = v } }
+    /// Focus scores by shot id, from the engine's sweep. Absent = unmeasured.
+    @Published private(set) var sharp: [String: Double] = [:]
+    /// Shots that are the sharpest frame of their burst (engine-computed).
+    @Published private(set) var focusBest: Set<String> = []
     @Published private(set) var cameraID = ""
 
     @Published private(set) var states: [Character] = []
@@ -98,7 +102,16 @@ final class GridModel: ObservableObject {
             // every observer, and at 24k shots gratuitous invalidations from
             // this loop kept SwiftUI re-rendering longer than the poll period
             var rawStates = "", rawOrient = "", rawImmich = ""
+            var sharpTick = 0
             while !Task.isCancelled {
+                // Scores creep forward far slower than thumbs, and the payload
+                // is a whole map — poll it every ~10th round, not every round.
+                if sharpTick % 10 == 0, let s = try? await api.fetchSharpness(), let self {
+                    if s.scores.count != self.sharp.count { self.sharp = s.scores }
+                    let best = Set(s.best ?? [])
+                    if best != self.focusBest { self.focusBest = best }
+                }
+                sharpTick += 1
                 if let t = try? await api.fetchThumbs(), let self {
                     if t.states != rawStates { rawStates = t.states; self.states = Array(t.states) }
                     if t.orient != rawOrient {
@@ -144,8 +157,25 @@ final class GridModel: ObservableObject {
     func buffered(_ id: String) -> Bool { fetchStates[id] == "ready" }
     func failed(_ id: String) -> Bool { fetchStates[id] == "failed" }
 
+    // MARK: - focus scores
+    //
+    // The engine decides which frame won its burst; the client only renders the
+    // verdict. That split is deliberate: the comparison needs EXIF capture
+    // times to group bursts, and a raw score compared across different scenes
+    // is meaningless (texture dominates focus), so there is nothing safe for
+    // the client to compute on its own.
+
+    /// True when this frame is the sharpest of its burst. False for frames in
+    /// no burst, or in a burst the sweep hasn't finished measuring.
+    func isFocusBest(_ i: Int) -> Bool {
+        guard shots.indices.contains(i) else { return false }
+        return focusBest.contains(shots[i].id)
+    }
+
     func thumbURL(_ id: String, _ i: Int) -> URL? { api?.thumbURL(id, orient: orientOf(i)) }
     func imageURL(_ id: String) -> URL? { api?.imageURL(id) }
+    /// What the viewer displays and buffers; the full frame is reserved for zoom.
+    func previewURL(_ id: String) -> URL? { api?.previewURL(id, max: FullImageStore.previewMax) }
     func videoURL(_ id: String) -> URL? { api?.videoURL(id) }
 
     // MARK: - actions
@@ -156,17 +186,44 @@ final class GridModel: ObservableObject {
     }
     func hint(_ i: Int) { Task { await api?.setThumbHint(i) } }
 
-    /// Warm the decoded-image cache around the viewer cursor so an instant
-    /// flick lands on a ready bitmap instead of a black frame. Photos only —
-    /// videos stream through mpv, not /api/image.
-    func prefetchViewer(around i: Int, radius: Int = 2) {
+    /// Buffer around the viewer cursor so a flick lands on a ready frame
+    /// instead of a spinner. Two tiers (see FullImageStore): a few frames
+    /// decoded in memory for the instant next/prev flick, and a much wider
+    /// band of raw JPEGs pulled onto disk so swiping a burst never waits on
+    /// the network. Both are ahead-biased — culling runs forwards. Photos
+    /// only; videos stream through mpv, not /api/image.
+    func prefetchViewer(around i: Int) {
         guard let api else { return }
-        for d in 1...radius {
-            for j in [i + d, i - d] where shots.indices.contains(j) {
-                guard shots[j].kind != "video" else { continue }
-                FullImageStore.shared.prefetch(api.imageURL(shots[j].id))
+        // near tier first so it claims its lane before the wide sweep queues
+        for j in window(i, FullImageStore.decodeAhead, FullImageStore.decodeBehind) {
+            FullImageStore.shared.prefetch(api.previewURL(shots[j].id, max: FullImageStore.previewMax))
+        }
+        for j in window(i, FullImageStore.warmAhead, FullImageStore.warmBehind) {
+            FullImageStore.shared.warm(api.previewURL(shots[j].id, max: FullImageStore.previewMax))
+        }
+        // Zoomed in, the viewer upgrades each shot to its original frame — so
+        // warm the neighbours' originals too, or stepping through a burst at
+        // one crop waits on a ~12 MB fetch at every step. Unzoomed browsing
+        // never pays for this.
+        if viewerZoomed {
+            for j in window(i, FullImageStore.fullAhead, FullImageStore.fullBehind) {
+                FullImageStore.shared.warm(api.imageURL(shots[j].id))
             }
         }
+    }
+
+    /// Photo indices around `i`, nearest-first so the frames you'll reach
+    /// soonest are requested first.
+    private func window(_ i: Int, _ ahead: Int, _ behind: Int) -> [Int] {
+        var out: [Int] = []
+        for d in 1...max(ahead, behind) {
+            for j in [i + d, i - d] where shots.indices.contains(j) {
+                guard shots[j].kind != "video" else { continue }
+                if j > i && d <= ahead { out.append(j) }
+                if j < i && d <= behind { out.append(j) }
+            }
+        }
+        return out
     }
 
     func openViewer(_ i: Int) {

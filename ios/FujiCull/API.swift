@@ -62,6 +62,15 @@ struct ThumbInfo: Decodable {
     let immich: String      // '1' = already uploaded
 }
 
+// Focus data from the engine's sweep. `scores` grows as it progresses; `best`
+// is the sharpest frame of each burst — the only focus comparison that means
+// anything, since the raw score tracks how much texture a scene has as much as
+// whether it's in focus. Grouping is done engine-side from EXIF capture times.
+struct SharpnessInfo: Decodable {
+    let scores: [String: Double]
+    let best: [String]?
+}
+
 // API is a thin client of the engine's loopback HTTP surface — the same
 // endpoints the Android app and web UI drive.
 final class API {
@@ -81,6 +90,7 @@ final class API {
 
     func fetchState() async throws -> AppState { try await get("api/state") }
     func fetchThumbs() async throws -> ThumbInfo { try await get("api/thumbs") }
+    func fetchSharpness() async throws -> SharpnessInfo { try await get("api/sharpness") }
     func fetchStatus() async throws -> EngineStatus { try await get("api/status") }
 
     func setCursor(_ index: Int) async { await post("api/cursor", ["index": index]) }
@@ -106,6 +116,16 @@ final class API {
         return keyed(c.url!)
     }
     func imageURL(_ id: String) -> URL { single("api/image", id) }
+
+    /// A copy of the frame scaled to `max` px on the long edge — an order of
+    /// magnitude fewer bytes than the original, which is what lets the viewer
+    /// buffer ahead faster than a finger swipes. Zoom still loads imageURL.
+    func previewURL(_ id: String, max: Int) -> URL {
+        var c = URLComponents(url: base.appendingPathComponent("api/image"), resolvingAgainstBaseURL: false)!
+        c.queryItems = [.init(name: "id", value: id), .init(name: "max", value: String(max))]
+        return keyed(c.url!)
+    }
+
     func videoURL(_ id: String) -> URL { single("api/video", id) }
     func videoHeadURL(_ id: String) -> URL { single("api/videohead", id) }
 

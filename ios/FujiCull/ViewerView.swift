@@ -12,6 +12,9 @@ struct ViewerView: View {
     // Off by default: photos cut instantly between frames so a burst can be
     // blink-compared in place. The slide made spotting what moved harder.
     @AppStorage("viewerAnimations") private var animate = false
+    // Focus peaking: same storage the settings toggle writes, so the viewer
+    // button and the setting are one state rather than two that drift.
+    @AppStorage("focusPeaking") private var peaking = false
 
     private var shot: Shot? { model.shots.indices.contains(index) ? model.shots[index] : nil }
     private var decision: String { shot.flatMap { model.decisions[$0.id] } ?? "" }
@@ -45,6 +48,9 @@ struct ViewerView: View {
             model.prefetchViewer(around: i) // warm neighbours so the next flick is instant
         }
         .onAppear { model.prefetchViewer(around: index) }
+        // Zooming in on a shot you're already on opens the full-frame window
+        // (see prefetchViewer) — warm it then, not at the next step.
+        .onChange(of: model.viewerZoomed) { _ in model.prefetchViewer(around: index) }
         .keyCommands { key in
             switch key {
             case "k", "w": decide("keep"); return true
@@ -52,6 +58,7 @@ struct ViewerView: View {
             case "c", "e": decide("clear"); return true
             case "right", "enter", " ": advance(); return true
             case "left": if index > 0 { step { index -= 1 } }; return true
+            case "f": togglePeaking(); return true
             case "?", "/": showKeymap.toggle(); return true
             case "esc":
                 if showKeymap { showKeymap = false } else { dismiss() }
@@ -59,6 +66,12 @@ struct ViewerView: View {
             default: return false
             }
         }
+    }
+
+    private func togglePeaking() {
+        peaking.toggle()
+        // Overlays are full-size bitmaps; don't hold them while hidden.
+        if !peaking { FocusPeaking.flush() }
     }
 
     private var topBar: some View {
@@ -72,6 +85,23 @@ struct ViewerView: View {
                     .font(.system(.subheadline, design: .monospaced))
             }
             Spacer()
+            // Only ever shown for the winner of a burst: the engine compares
+            // frames captured within a couple of seconds of each other, never
+            // across scenes, so this is a claim we can actually stand behind.
+            if model.isFocusBest(index) {
+                Text("SHARPEST OF BURST")
+                    .font(DS.micro(11))
+                    .foregroundStyle(DS.keep)
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(DS.surface.opacity(0.75))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.rTile))
+            }
+            Button { togglePeaking() } label: {
+                Image(systemName: peaking ? "circle.grid.cross.fill" : "circle.grid.cross")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(peaking ? DS.amber : .white)
+            }
+            .accessibilityLabel("Focus peaking")
             Text("\(index + 1)/\(model.shots.count)")
                 .font(.system(.subheadline, design: .monospaced))
                 .foregroundStyle(.secondary)
@@ -237,7 +267,7 @@ struct Filmstrip: View {
                         // videos use the client-side poster (the engine never
                         // has a thumb for them on mobile)
                         let poster = s.kind == "video" ? Posters.shared.cached(s) : nil
-                        ZStack(alignment: .bottom) {
+                        ZStack {
                             if let poster {
                                 ThumbView(url: poster, cacheKey: "\(s.id):poster", ready: true)
                             } else if let url = model.thumbURL(s.id, i) {
@@ -246,14 +276,21 @@ struct Filmstrip: View {
                             } else {
                                 Color.white.opacity(0.05)
                             }
+                        }
+                        .frame(width: 64, height: 44)
+                        .clipped()
+                        // The bar belongs to the tile, not the thumbnail: a
+                        // scaled-to-fill portrait thumb lays out taller than
+                        // the tile, so a bottom-aligned sibling inside the
+                        // stack sits below the clip and vanishes. Overlaying
+                        // the sized frame pins it to the tile's own edge.
+                        .overlay(alignment: .bottom) {
                             if decision == "keep" || decision == "reject" {
                                 Rectangle()
                                     .fill(decision == "keep" ? Color(red: 0.22, green: 0.84, blue: 0.48) : Color(red: 1.0, green: 0.35, blue: 0.24))
                                     .frame(height: 3)
                             }
                         }
-                        .frame(width: 64, height: 44)
-                        .clipped()
                         .overlay(Rectangle().stroke(i == index ? Color(red: 1.0, green: 0.70, blue: 0.18) : .clear, lineWidth: 2))
                         .id(i)
                         .onTapGesture { withAnimation { index = i } }
@@ -280,19 +317,31 @@ struct Filmstrip: View {
 // the pager to stop scrolling. The only way to the next shot while zoomed is a
 // timeline tap or KEEP/REJECT — the same rule the desktop and Android use.
 struct ZoomableImage: View {
+    /// Screen-sized copy — what's shown while browsing, and what the buffer
+    /// is built from.
     let url: URL?
+    /// The original frame, loaded only once you zoom in, so critical-focus
+    /// checks look at real pixels rather than a downscale.
+    let fullURL: URL?
     // holds the shared zoom + pan so advancing to the next shot keeps both —
     // the desktop comparison workflow ("same crop, next frame") on touch
     var model: GridModel? = nil
+    @AppStorage("focusPeaking") private var peaking = false
     @State private var image: UIImage?
     @State private var loadFailed = false
+    @State private var showingFull = false
     @State private var scale: CGFloat = 1
     @State private var offset: CGSize = .zero
     @GestureState private var pinch: CGFloat = 1
     @GestureState private var drag: CGSize = .zero
 
-    init(url: URL?, model: GridModel? = nil) {
+    /// Zoom past this and the preview's pixels would start to show, so the
+    /// original is fetched.
+    private static let fullResAt: CGFloat = 1.2
+
+    init(url: URL?, fullURL: URL? = nil, model: GridModel? = nil) {
         self.url = url
+        self.fullURL = fullURL
         self.model = model
         // Seed the image synchronously from the decoded cache so a page the
         // pager just created renders it on frame ONE — no black flash while an
@@ -310,6 +359,18 @@ struct ZoomableImage: View {
                         .scaledToFit()
                         .scaleEffect(scale * pinch)
                         .offset(liveOffset(geo.size, imgSize))
+                    // Focus peaking rides the SAME geometry modifiers as the
+                    // frame, so the edges stay registered to the pixels under
+                    // any zoom or pan. Built from whatever is displayed: the
+                    // preview at 1x, the original once zoomed.
+                    if peaking, let peak = peakOverlay(for: image) {
+                        Image(uiImage: peak)
+                            .resizable()
+                            .scaledToFit()
+                            .scaleEffect(scale * pinch)
+                            .offset(liveOffset(geo.size, imgSize))
+                            .allowsHitTesting(false)
+                    }
                 } else if loadFailed {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.system(size: 40)).foregroundStyle(.orange)
@@ -394,6 +455,30 @@ struct ZoomableImage: View {
         model?.viewerZoom = scale
         model?.viewerPan = offset
         model?.setViewerZoomed(scale > 1.01)
+        ensureFullRes()
+    }
+
+    /// The peaking overlay for the frame on screen. Keyed by url + whether
+    /// we've swapped to the original, so zooming rebuilds it against the
+    /// sharper pixels instead of reusing the preview's edges.
+    private func peakOverlay(for img: UIImage) -> UIImage? {
+        guard let url else { return nil }
+        return FocusPeaking.overlay(for: img, key: "\(url.absoluteString)|\(showingFull)")
+    }
+
+    /// Once zoomed in, quietly upgrade the displayed preview to the original
+    /// frame. The swap keeps zoom and pan, so it reads as the image sharpening
+    /// rather than anything reloading.
+    private func ensureFullRes() {
+        guard scale > Self.fullResAt, !showingFull, let fullURL else { return }
+        showingFull = true
+        Task {
+            if let full = await FullImageStore.shared.load(fullURL) {
+                image = full
+            } else {
+                showingFull = false // let a later zoom retry
+            }
+        }
     }
 
     private func load() async {
@@ -407,14 +492,22 @@ struct ZoomableImage: View {
         if image == nil, let url, let cached = FullImageStore.shared.image(for: url) {
             image = cached
         }
-        if image != nil { return }
+        if image != nil {
+            // paged in already zoomed (timeline tap / KEEP while zoomed) —
+            // that inherited zoom still wants real pixels
+            ensureFullRes()
+            return
+        }
         loadFailed = false
-        guard let url,
-              let (data, resp) = try? await URLSession.shared.data(from: url),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let raw = UIImage(data: data) else { loadFailed = true; return }
-        let ready = (await raw.byPreparingForDisplay()) ?? raw
-        FullImageStore.shared.remember(ready, for: url)
+        // Through the store, so this shares the full-image session's disk
+        // cache: a frame the far tier already pulled decodes without a
+        // round-trip, and the result lands in the decoded cache for the flick
+        // back.
+        guard let url, let ready = await FullImageStore.shared.load(url) else {
+            loadFailed = true
+            return
+        }
         image = ready
+        ensureFullRes()
     }
 }
