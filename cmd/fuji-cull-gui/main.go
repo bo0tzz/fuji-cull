@@ -11,6 +11,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -389,6 +390,30 @@ type videoPlayer interface {
 
 type zoomMem struct{ scale, cx, cy, aspect float64 }
 
+// setupGUILogging tees the log to a file. A .app launched from Finder has no
+// terminal, so without this every camera and import diagnostic the engine
+// prints is discarded — which is exactly what you need after a failed import.
+func setupGUILogging(logPath string) {
+	if logPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		dir := filepath.Join(home, ".local", "share", "fuji-cull", "logs")
+		if os.MkdirAll(dir, 0o755) != nil {
+			return
+		}
+		logPath = filepath.Join(dir, fmt.Sprintf("fuji-cull-gui-%s.log",
+			time.Now().Format("20060102-150405")))
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.Printf("gui: logging to %s", logPath)
+}
+
 func main() {
 	var o cull.Options
 	flag.StringVar(&o.Listen, "listen", "127.0.0.1:8787", "HTTP listen address for the built-in web UI")
@@ -415,8 +440,10 @@ func main() {
 	flag.StringVar(&o.EngineKey, "engine-key", os.Getenv("FUJI_ENGINE_KEY"), "require this key on /api/* to expose the engine on the LAN (or env FUJI_ENGINE_KEY)")
 	decodeAhead := flag.Int("decode-ahead", 28, "decoded frames to hold ahead of the cursor (~104 MB RAM each)")
 	decodeBehind := flag.Int("decode-behind", 8, "decoded frames to hold behind the cursor")
+	logPath := flag.String("log", "", "log file (default: ~/.local/share/fuji-cull/logs/fuji-cull-gui-<ts>.log)")
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	setupGUILogging(*logPath)
 	setupBundleEnv()
 
 	// Prefer native Wayland over XWayland: SDL's X11 driver hands out a GLX
