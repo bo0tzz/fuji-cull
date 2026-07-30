@@ -135,7 +135,8 @@ struct TimelineCollection: UIViewRepresentable {
                         buffered: m.buffered(shot.id),
                         isVideo: shot.kind == "video",
                         isCursor: m.cursor == index,
-                        hasRAF: shot.hasRAF)
+                        hasRAF: shot.hasRAF,
+                        focusBest: m.isFocusBest(index))
                 }
                 .margins(.all, 0)
                 // the thumb scales-to-fill; without this it bleeds past the
@@ -460,9 +461,10 @@ struct TileContent: View {
     let isVideo: Bool
     let isCursor: Bool
     var hasRAF: Bool = false
+    var focusBest: Bool = false
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             if let url, ready {
                 ThumbView(url: url, cacheKey: cacheKey, ready: ready, exifOrient: exifOrient)
             } else {
@@ -470,16 +472,21 @@ struct TileContent: View {
                 // cells; the design's shimmer is dropped for scroll smoothness)
                 PendingStripes()
             }
-            // decision bar: the glanceable edge. 6px decided; 3px faint
-            // hairline for undecided so the slot reads "not yet", not empty.
+        }
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+        .clipped()
+        // decision bar: the glanceable edge. 6px decided; 3px faint
+        // hairline for undecided so the slot reads "not yet", not empty.
+        // Overlaid on the sized tile rather than stacked with the thumb —
+        // the thumb scales to fill and lays out past the cell, which would
+        // carry a bottom-aligned sibling out of view on portrait shots.
+        .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(decision == "keep" ? DS.keep
                       : decision == "reject" ? DS.reject
                       : DS.undecidedHairline)
                 .frame(height: decision.isEmpty ? 3 : 6)
         }
-        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-        .clipped()
         .overlay(alignment: .topLeading) {
             if hasRAF {
                 Text("RAF")
@@ -505,6 +512,20 @@ struct TileContent: View {
                 }
             }
             .padding(DS.s1)
+        }
+        .overlay(alignment: .bottomTrailing) {
+            // The sharpest frame among its neighbours — a burst's likely keeper.
+            // Deliberately a rank, not a score: focus numbers aren't comparable
+            // between different scenes, only between shots of the same thing.
+            if focusBest {
+                Image(systemName: "scope")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(DS.amber)
+                    .padding(2)
+                    .background(DS.bg.opacity(0.6), in: Circle())
+                    .padding(.trailing, DS.s1)
+                    .padding(.bottom, 8) // clear of the decision bar
+            }
         }
         .overlay {
             if isVideo {

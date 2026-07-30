@@ -31,6 +31,18 @@ type Options struct {
 	UploadConcurrency int
 	HashConcurrency   int
 	DryRun            bool
+	// BufferAhead caps how many copied-but-not-yet-uploaded files may sit on
+	// disk at once. Zero means unbounded. Used with DeleteAfterUpload to keep
+	// an upload-only import inside a fixed disk footprint.
+	BufferAhead int
+	// BufferBytes caps the SIZE of that buffer. A file count alone does not
+	// bound disk: fifty queued videos are a different proposition from fifty
+	// JPEGs. Zero means no size limit.
+	BufferBytes int64
+	// DeleteAfterUpload removes each local file once the server has accepted
+	// it. Only sane for staged copies: the camera still holds the original,
+	// so the worst case is re-running the import.
+	DeleteAfterUpload bool
 	// Progress, when non-nil, receives (phase, done, total) updates.
 	Progress func(phase string, done, total int)
 }

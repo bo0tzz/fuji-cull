@@ -167,7 +167,7 @@ private struct PageContent: View {
             if s.kind == "video" {
                 VideoFrame(model: model, shot: s, active: model.viewerIndex == i)
             } else {
-                ZoomableImage(url: model.imageURL(s.id), model: model)
+                ZoomableImage(url: model.previewURL(s.id), fullURL: model.imageURL(s.id), model: model)
             }
         } else {
             Color.black

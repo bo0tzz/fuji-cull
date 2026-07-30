@@ -15,6 +15,7 @@ struct SettingsView: View {
     // UI-only preference: applies immediately, no engine restart (unlike the
     // draft fields, which are saved and restart the camera link).
     @AppStorage("viewerAnimations") private var viewerAnimations = false
+    @AppStorage("focusPeaking") private var focusPeaking = false
 
     var body: some View {
         NavigationStack {
@@ -32,6 +33,19 @@ struct SettingsView: View {
                     Text("Leave the URL or key empty to import without uploading.")
                 }
 
+                Section {
+                    TextField("http://192.168.1.50:8787", text: $draft.remoteURL)
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                    SecureField("engine key", text: $draft.remoteKey)
+                } header: {
+                    Text("Camera source")
+                } footer: {
+                    Text("Leave empty to use this device's camera. Set a URL to browse a camera plugged into another machine (that engine must be started with --engine-key). Saving reconnects.")
+                }
+
                 Section("Import destination") {
                     TextField("path", text: $draft.importDest)
                         .font(.system(.footnote, design: .monospaced))
@@ -41,14 +55,34 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Animate photo transitions", isOn: $viewerAnimations)
+                    Toggle("Focus peaking overlay", isOn: $focusPeaking)
                 } header: {
                     Text("Viewer")
                 } footer: {
-                    Text("Off cuts instantly between photos so you can compare frames in a burst. On slides each page in. Applies immediately.")
+                    Text("Animation off cuts instantly between photos so you can compare frames in a burst. On slides each page in.\n\nFocus peaking paints the in-focus edges of the frame — tap the ◈ button in the viewer, or press F, to flick it on and off. Zoomed in it measures the original file, so it shows true critical focus.")
                 }
 
                 Section {
-                    LabeledContent("Link", value: engine.mode == .camera ? "camera (ImageCaptureCore)" : "fake corpus")
+                    TextField("https://sync.example.com", text: $draft.syncURL)
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    SecureField("sync api key", text: $draft.syncKey)
+                } header: {
+                    Text("Cross-device sync")
+                } footer: {
+                    Text("Point at your self-hosted fuji-sync server to sync keep/reject decisions across devices. Leave empty to disable. Saving restarts the engine.")
+                }
+
+                Section {
+                    LabeledContent("Link", value: {
+                        switch engine.mode {
+                        case .camera: return "camera (ImageCaptureCore)"
+                        case .remote: return "remote host"
+                        case .fake: return "fake corpus"
+                        case .none: return "—"
+                        }
+                    }())
                     LabeledContent("Loopback", value: ":\(engine.port)")
                     LabeledContent("Shots", value: "\(engine.shotCount)")
                     Toggle(isOn: $draft.forceFake) {
@@ -94,7 +128,7 @@ struct SettingsView: View {
             .alert("Full rescan?", isPresented: $confirmRescan) {
                 Button("Rescan", role: .destructive) {
                     Task {
-                        if let base = engine.baseURL { await API(base: base).rescan() }
+                        if let base = engine.baseURL { await API(base: base, key: engine.apiKey).rescan() }
                         store.settings = draft
                         engine.restart(draft)
                         dismiss()

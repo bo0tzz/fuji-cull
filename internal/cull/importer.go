@@ -23,9 +23,13 @@ type Importer struct {
 }
 
 type ImportStatus struct {
-	Running    bool   `json:"running"`
-	Phase      string `json:"phase"` // idle | copy | hash | upload | validate | done | error
-	Done       int    `json:"done"`
+	Running bool   `json:"running"`
+	Phase   string `json:"phase"` // idle | copy | upload | validate | done | error
+	Done    int    `json:"done"`  // files copied off the camera
+	// Uploaded counts files pushed to Immich. It is separate from Done
+	// because the two now run at the same time: sharing one counter made the
+	// number jump between copy and upload progress.
+	Uploaded   int    `json:"uploaded"`
 	Total      int    `json:"total"`
 	Message    string `json:"message"`
 	Error      string `json:"error"`
@@ -46,6 +50,32 @@ func (im *Importer) update(fn func(*ImportStatus)) {
 	im.mu.Unlock()
 }
 
+// stageBufferAhead is how many copied-but-not-yet-uploaded files may sit in
+// the staging directory at once. The camera pull blocks past this, so disk use
+// stays flat regardless of how many shots are being imported. Chunked camera
+// batches mean the real peak is this plus one batch.
+const stageBufferAhead = 50
+
+// stageBufferBytes caps that buffer by size as well. Fifty 25 MB JPEGs is a
+// gigabyte; fifty videos could be a hundred. Whichever limit is reached first
+// stalls the camera pull, so the footprint is bounded either way.
+//
+// A file is admitted whenever the buffer is under this, even if it takes it
+// over — so a large video starts copying alongside the photos already in
+// flight instead of waiting for them to drain. Peak disk is therefore this
+// plus one file, not a hard ceiling.
+const stageBufferBytes = 8 << 30 // 8 GiB
+
+// ImportOptions are the per-run choices offered in the import panel.
+type ImportOptions struct {
+	// Immich uploads to the configured server. Off imports to disk only.
+	Immich bool
+	// KeepLocal keeps the copies in dest. Off makes the copy a staging step:
+	// files land in a temp directory and are removed once the upload has been
+	// verified against the server, so nothing is deleted on trust.
+	KeepLocal bool
+}
+
 // keeperFile is one camera file belonging to a kept shot.
 type keeperFile struct {
 	shot *photo.Shot
@@ -53,8 +83,16 @@ type keeperFile struct {
 }
 
 // Start kicks off an import of the current keepers in the background.
-func (im *Importer) Start(app *App, dest, album string) error {
-	if dest == "" {
+func (im *Importer) Start(app *App, dest, album string, opt ImportOptions) error {
+	if !opt.Immich && !opt.KeepLocal {
+		return fmt.Errorf("nothing to do: uploading is off and local copies are not being kept")
+	}
+	if opt.Immich {
+		if _, _, _, _, active := app.ImmichSettings(); !active {
+			return fmt.Errorf("Immich upload is on but no server/key is configured — add them in settings, or turn uploading off")
+		}
+	}
+	if opt.KeepLocal && dest == "" {
 		return fmt.Errorf("no destination configured; pass --dest at startup or in the import request")
 	}
 	keepers := app.keeperFiles()
@@ -67,7 +105,9 @@ func (im *Importer) Start(app *App, dest, album string) error {
 		im.mu.Unlock()
 		return fmt.Errorf("an import is already running")
 	}
-	saveImportDefaults(dest, album) // prefill the panel next session
+	if opt.KeepLocal {
+		saveImportDefaults(dest, album) // prefill the panel next session
+	}
 	im.status = ImportStatus{
 		Running:   true,
 		Phase:     "copy",
@@ -77,26 +117,78 @@ func (im *Importer) Start(app *App, dest, album string) error {
 	}
 	im.mu.Unlock()
 
-	go im.run(app, dest, album, keepers)
+	go im.run(app, dest, album, keepers, opt)
 	return nil
 }
 
-func (im *Importer) run(app *App, dest, album string, keepers []keeperFile) {
+func (im *Importer) run(app *App, dest, album string, keepers []keeperFile, opt ImportOptions) {
 	// The camera link is single-threaded: wait out any in-flight prefetch,
 	// then own the link for the whole copy phase.
 	app.prefetch.PauseAndDrain()
 	defer app.prefetch.Resume()
 
-	files, err := im.copyPhase(app, dest, keepers)
-	if err == nil {
-		opts := app.pipelineOpts
-		opts.Dest = dest
-		opts.ImmichAlbum = album
-		opts.Progress = func(phase string, done, total int) {
-			im.update(func(s *ImportStatus) { s.Phase = phase; s.Done = done; s.Total = total })
+	// Upload-only: stage into a temp directory that is removed once the
+	// server has confirmed every file. Nothing is deleted before that.
+	staging := ""
+	if !opt.KeepLocal {
+		tmp, terr := os.MkdirTemp(app.prefetch.cache, "import-stage-")
+		if terr != nil {
+			im.update(func(s *ImportStatus) {
+				s.Running, s.Phase = false, "error"
+				s.Error = fmt.Sprintf("staging dir: %v", terr)
+				s.FinishedAt = time.Now().Format(time.RFC3339)
+			})
+			return
 		}
-		im.update(func(s *ImportStatus) { s.Phase = "hash"; s.Done = 0; s.Total = len(files) })
-		err = pipeline.Run(context.Background(), opts, files)
+		staging, dest = tmp, tmp
+	}
+
+	opts := app.pipeline()
+	opts.Dest = dest
+	opts.ImmichAlbum = album
+	if !opt.Immich {
+		opts.SkipImmich = true
+	}
+	if staging != "" {
+		// Staged copies are scratch: keep only a working set on disk and drop
+		// each file as the server takes it, so a 900-shot upload-only import
+		// costs a few GB of disk instead of all of it.
+		opts.BufferAhead = stageBufferAhead
+		opts.BufferBytes = stageBufferBytes
+		opts.DeleteAfterUpload = true
+	}
+	opts.Progress = func(phase string, done, total int) {
+		im.update(func(s *ImportStatus) {
+			if phase == "upload" {
+				s.Uploaded = done // copy owns Done; these advance together
+				return
+			}
+			s.Phase = phase
+		})
+	}
+
+	var files []photo.FileEntry
+	ctx := context.Background()
+	// Hash and upload run alongside the camera pull rather than after it: the
+	// two use different resources, and serialising them doubled import time.
+	stream, err := pipeline.NewStreamer(ctx, opts, len(keepers))
+	if err == nil {
+		files, err = im.copyPhase(app, dest, keepers, stream.Add)
+		if err == nil && opt.Immich {
+			im.update(func(s *ImportStatus) { s.Phase = "upload" })
+		}
+		// Always drain the workers, even when the pull failed part-way, or
+		// their goroutines would outlive the import.
+		if werr := stream.Wait(); err == nil {
+			err = werr
+		}
+	}
+	if staging != "" {
+		if err == nil {
+			os.RemoveAll(staging) // verified on the server; the copy was scratch
+		} else {
+			log.Printf("import: staged copies kept at %s (upload did not verify)", staging)
+		}
 	}
 
 	im.update(func(s *ImportStatus) {
@@ -107,7 +199,14 @@ func (im *Importer) run(app *App, dest, album string, keepers []keeperFile) {
 			s.Error = err.Error()
 		} else {
 			s.Phase = "done"
-			s.Message = fmt.Sprintf("%d files imported to %s", len(files), dest)
+			switch {
+			case staging != "":
+				s.Message = fmt.Sprintf("%d files uploaded to Immich (no local copy kept)", len(files))
+			case opt.Immich:
+				s.Message = fmt.Sprintf("%d files imported to %s and uploaded", len(files), dest)
+			default:
+				s.Message = fmt.Sprintf("%d files imported to %s", len(files), dest)
+			}
 		}
 	})
 	if err != nil {
@@ -133,11 +232,12 @@ func (im *Importer) run(app *App, dest, album string, keepers []keeperFile) {
 // kept, cached camera-verbatim copies (prefetched JPGs/RAFs/videos) are
 // copied locally, and the remainder is pulled from the camera in per-folder
 // batches. Returns the FileEntry list for the pipeline.
-func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile) ([]photo.FileEntry, error) {
+func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile, onFile func(photo.FileEntry)) ([]photo.FileEntry, error) {
 	type pullItem struct {
 		it   fetchItem
 		size int64
 		kind string
+		idx  int // into files, so a landed pull can be handed straight on
 	}
 	files := make([]photo.FileEntry, len(keepers))
 	var toPull []pullItem
@@ -155,6 +255,7 @@ func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile) ([]ph
 		if st, err := os.Stat(target); err == nil && st.Size() > 0 && (wantSize == 0 || st.Size() == wantSize) {
 			done++
 			im.update(func(s *ImportStatus) { s.Done = done })
+			onFile(files[i])
 			continue
 		}
 		if cached, ok := app.prefetch.CachedFile(k.shot, k.ext); ok {
@@ -162,6 +263,7 @@ func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile) ([]ph
 			if err := copyFile(cached, tmp); err == nil && commit(tmp, target) == nil {
 				done++
 				im.update(func(s *ImportStatus) { s.Done = done })
+				onFile(files[i])
 				continue
 			}
 			os.Remove(tmp)
@@ -178,7 +280,7 @@ func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile) ([]ph
 				CameraDir: k.shot.CameraDir, Name: name,
 				ObjectID: k.shot.ObjectIDs[k.ext], Dest: target + ".tmp",
 			},
-			size: wantSize, kind: kind,
+			size: wantSize, kind: kind, idx: i,
 		})
 	}
 
@@ -209,7 +311,20 @@ func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile) ([]ph
 			}
 			ctx, cancel := context.WithTimeout(context.Background(),
 				60*time.Second+time.Duration(len(items))*15*time.Second)
-			fetchErr := app.backend.Fetch(ctx, items)
+			// Ride the persistent partial-read session when there is one —
+			// the same path browsing uses. A one-shot aft per chunk is what
+			// trips this camera into replaying stale buffers, which is why an
+			// import could fail on a card that browsed perfectly.
+			var fetchErr error
+			if app.prefetch.partsOK() {
+				sizes := make([]int64, len(chunk))
+				for i, c := range chunk {
+					sizes[i] = c.size
+				}
+				fetchErr = app.prefetch.fetchItemsViaParts(ctx, items, sizes)
+			} else {
+				fetchErr = app.backend.Fetch(ctx, items)
+			}
 			cancel()
 			if fetchErr != nil {
 				log.Printf("import: chunk of %d: %v", len(items), fetchErr)
@@ -233,6 +348,7 @@ func (im *Importer) copyPhase(app *App, dest string, keepers []keeperFile) ([]ph
 				}
 				done++
 				im.update(func(s *ImportStatus) { s.Done = done })
+				onFile(files[c.idx])
 			}
 			if garbage > 0 {
 				// Trip the breaker so the UIs show CAMERA SICK; an

@@ -62,14 +62,35 @@ struct ThumbInfo: Decodable {
     let immich: String      // '1' = already uploaded
 }
 
+// Focus data from the engine's sweep. `scores` grows as it progresses; `best`
+// is the sharpest frame of each burst — the only focus comparison that means
+// anything, since the raw score tracks how much texture a scene has as much as
+// whether it's in focus. Grouping is done engine-side from EXIF capture times.
+struct SharpnessInfo: Decodable {
+    let scores: [String: Double]
+    let best: [String]?
+}
+
 // API is a thin client of the engine's loopback HTTP surface — the same
 // endpoints the Android app and web UI drive.
 final class API {
     let base: URL
-    init(base: URL) { self.base = base }
+    // Engine key for remote (LAN) hosts. Empty for a local loopback engine
+    // (no auth). JSON calls send it as the x-api-key header; media URLs carry it
+    // as ?key= so mpv / <video> / image loaders authenticate without headers.
+    private let key: String
+    init(base: URL, key: String = "") { self.base = base; self.key = key }
+
+    /// Appends the engine key to a media URL when talking to a remote host.
+    private func keyed(_ url: URL) -> URL {
+        guard !key.isEmpty, var c = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        c.queryItems = (c.queryItems ?? []) + [.init(name: "key", value: key)]
+        return c.url ?? url
+    }
 
     func fetchState() async throws -> AppState { try await get("api/state") }
     func fetchThumbs() async throws -> ThumbInfo { try await get("api/thumbs") }
+    func fetchSharpness() async throws -> SharpnessInfo { try await get("api/sharpness") }
     func fetchStatus() async throws -> EngineStatus { try await get("api/status") }
 
     func setCursor(_ index: Int) async { await post("api/cursor", ["index": index]) }
@@ -92,26 +113,39 @@ final class API {
         var q: [URLQueryItem] = [.init(name: "id", value: id), .init(name: "raw", value: "1")]
         if tick > 0 { q.append(.init(name: "rt", value: String(tick))) }
         c.queryItems = q
-        return c.url!
+        return keyed(c.url!)
     }
     func imageURL(_ id: String) -> URL { single("api/image", id) }
+
+    /// A copy of the frame scaled to `max` px on the long edge — an order of
+    /// magnitude fewer bytes than the original, which is what lets the viewer
+    /// buffer ahead faster than a finger swipes. Zoom still loads imageURL.
+    func previewURL(_ id: String, max: Int) -> URL {
+        var c = URLComponents(url: base.appendingPathComponent("api/image"), resolvingAgainstBaseURL: false)!
+        c.queryItems = [.init(name: "id", value: id), .init(name: "max", value: String(max))]
+        return keyed(c.url!)
+    }
+
     func videoURL(_ id: String) -> URL { single("api/video", id) }
     func videoHeadURL(_ id: String) -> URL { single("api/videohead", id) }
 
     private func single(_ path: String, _ id: String) -> URL {
         var c = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         c.queryItems = [.init(name: "id", value: id)]
-        return c.url!
+        return keyed(c.url!)
     }
 
     private func get<T: Decodable>(_ path: String) async throws -> T {
-        let (data, _) = try await URLSession.shared.data(from: base.appendingPathComponent(path))
+        var req = URLRequest(url: base.appendingPathComponent(path))
+        if !key.isEmpty { req.setValue(key, forHTTPHeaderField: "x-api-key") }
+        let (data, _) = try await URLSession.shared.data(for: req)
         return try JSONDecoder().decode(T.self, from: data)
     }
     private func post(_ path: String, _ body: [String: Any]) async {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !key.isEmpty { req.setValue(key, forHTTPHeaderField: "x-api-key") }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         _ = try? await URLSession.shared.data(for: req)
     }

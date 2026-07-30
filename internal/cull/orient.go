@@ -84,9 +84,14 @@ func (p *Prefetcher) harvestOrient(s *photo.Shot) {
 		return
 	}
 	p.mu.Lock()
-	_, known := p.orient[s.ID]
+	_, haveOrient := p.orient[s.ID]
+	_, haveTaken := p.taken[s.ID]
 	p.mu.Unlock()
-	if known {
+	// Both facts come out of the same 64 KB read, so keep going while EITHER is
+	// missing. Gating on orientation alone meant a card whose orientation was
+	// already harvested never yielded a capture time, and without times nothing
+	// groups into bursts.
+	if haveOrient && haveTaken {
 		return
 	}
 	f, err := os.Open(p.displayPath(s))
@@ -100,9 +105,21 @@ func (p *Prefetcher) harvestOrient(s *photo.Shot) {
 		return
 	}
 	v := jpegmeta.Orientation(head[:n])
+	// Capture time rides along: it's in the same EXIF block we just read, and
+	// grouping frames into bursts is what makes a focus score comparable
+	// (see sharpness.go — texture, not focus, dominates across scenes).
+	taken := captureUnix(jpegmeta.DateTimeOriginal(head[:n]))
 	p.mu.Lock()
-	p.orient[s.ID] = uint8(v)
-	p.orientDirty = true
+	// Don't let a re-read for the sake of the timestamp clobber an orientation
+	// we already trust with a fresh parse that came back unknown.
+	if !haveOrient {
+		p.orient[s.ID] = uint8(v)
+		p.orientDirty = true
+	}
+	if taken > 0 {
+		p.taken[s.ID] = taken
+		p.takenDirty = true
+	}
 	p.mu.Unlock()
 }
 
@@ -114,7 +131,9 @@ func (p *Prefetcher) backfillOrient() {
 		if s.Kind != "photo" {
 			continue
 		}
-		if _, known := p.orient[s.ID]; known {
+		_, haveOrient := p.orient[s.ID]
+		_, haveTaken := p.taken[s.ID]
+		if haveOrient && haveTaken {
 			continue
 		}
 		if st, ok := p.state[s.ID]; ok && st.Status == "ready" {

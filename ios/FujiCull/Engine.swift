@@ -11,7 +11,7 @@ import Mobile
 // Everything above this talks to the engine over the loopback HTTP API.
 @MainActor
 final class Engine: ObservableObject {
-    enum Mode: String { case none, camera, fake }
+    enum Mode: String { case none, camera, fake, remote }
 
     @Published var mode: Mode = .none
     @Published var status: String = "starting engine…"
@@ -29,6 +29,25 @@ final class Engine: ObservableObject {
     private var bootTask: Task<Void, Never>?
     private var settings = AppSettings()
 
+    // Remote-host mode: the engine runs on another machine (the camera is
+    // plugged in there); this app is a pure thin HTTP client. remoteBase is that
+    // engine's URL and apiKey authenticates every request.
+    private var remoteBase: URL?
+    private(set) var apiKey: String = ""
+    private var remoteAuthValidated = false
+    private var remoteFailStreak = 0
+    // A DEDICATED session for the health/reachability poll, with its own
+    // connection pool separate from URLSession.shared (which the thumbnail flood
+    // uses). Otherwise a fast scrubber fling saturates the shared pool, the tiny
+    // health poll times out, and the app wrongly drops to the connect screen.
+    private let controlSession: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 8
+        c.httpMaximumConnectionsPerHost = 2
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: c)
+    }()
+
     /// The fake corpus exists so the app is buildable/testable without a camera.
     /// On real hardware it is never entered automatically — culling a synthetic
     /// corpus while believing you are looking at the card would be far worse
@@ -41,7 +60,10 @@ final class Engine: ObservableObject {
         #endif
     }
 
-    var baseURL: URL? { port > 0 ? URL(string: "http://127.0.0.1:\(port)") : nil }
+    var baseURL: URL? {
+        if let remoteBase { return remoteBase }
+        return port > 0 ? URL(string: "http://127.0.0.1:\(port)") : nil
+    }
     var defaultImportDest: String { settings.importDest }
 
     private var docs: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
@@ -56,7 +78,10 @@ final class Engine: ObservableObject {
         // silently — probe-measured as videos freezing seconds in with a
         // full buffer and rate=0.
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        ICCTransport.shared.start()
+        // Remote mode never touches the local camera transport.
+        if s.remoteURL.trimmingCharacters(in: .whitespaces).isEmpty {
+            ICCTransport.shared.start()
+        }
         bootTask = Task { await boot() }
     }
 
@@ -72,6 +97,9 @@ final class Engine: ObservableObject {
         pollTask?.cancel(); pollTask = nil
         engine?.stop()
         engine = nil
+        remoteBase = nil
+        apiKey = ""
+        remoteAuthValidated = false
         ready = false
         shotCount = 0
         port = 0
@@ -81,11 +109,22 @@ final class Engine: ObservableObject {
 
     private func boot() async {
         startError = nil
+        // Remote host: skip the local engine entirely and become a thin client.
+        let remote = settings.remoteURL.trimmingCharacters(in: .whitespaces)
+        if !remote.isEmpty {
+            await bootRemote(remote)
+            return
+        }
         let dataDir = docs.appendingPathComponent("engine").path
         let cacheDir = docs.appendingPathComponent("cache").path
         for p in [dataDir, cacheDir] {
             try? FileManager.default.createDirectory(atPath: p, withIntermediateDirectories: true)
         }
+
+        // Cross-device sync config reaches the Go engine via env (set before any
+        // MobileStart*), avoiding gomobile signature changes.
+        MobileSetEnv("FUJI_SYNC_URL", settings.syncURL.trimmingCharacters(in: .whitespaces))
+        MobileSetEnv("FUJI_SYNC_KEY", settings.syncKey.trimmingCharacters(in: .whitespaces))
 
         var e: MobileEngine?
         var nsErr: NSError?
@@ -157,6 +196,78 @@ final class Engine: ObservableObject {
             return nil
         }
         return MobileStartLocal(dataDir, cacheDir, corpus, "", &err)
+    }
+
+    // MARK: - remote host
+
+    private func bootRemote(_ urlString: String) async {
+        var s = urlString
+        if !s.contains("://") { s = "http://" + s } // bare host:port convenience
+        guard let url = URL(string: s), url.host != nil else {
+            startError = "invalid server URL"; status = "bad server URL"; mode = .none
+            return
+        }
+        remoteBase = url
+        apiKey = settings.remoteKey.trimmingCharacters(in: .whitespaces)
+        remoteAuthValidated = false
+        remoteFailStreak = 0
+        mode = .remote
+        ready = false
+        status = "connecting to \(url.host ?? "server")…"
+        epoch += 1
+        startRemotePolling()
+    }
+
+    private struct RemoteHealth: Decodable { let ok: Bool; let ready: Bool; let authRequired: Bool }
+
+    private func startRemotePolling() {
+        pollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                await self?.pollRemote()
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+        }
+    }
+
+    private func pollRemote() async {
+        guard let base = remoteBase else { return }
+        let host = base.host ?? "server"
+        // liveness + readiness via the open /api/health, on the dedicated pool
+        var hreq = URLRequest(url: base.appendingPathComponent("api/health"))
+        hreq.timeoutInterval = 8
+        guard let (data, resp) = try? await controlSession.data(for: hreq),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let h = try? JSONDecoder().decode(RemoteHealth.self, from: data) else {
+            // Tolerate transient blips: a heavy scrubber fling can briefly
+            // saturate the link. Only fall back to the connect screen after
+            // several CONSECUTIVE failures, and once ready never demote on a
+            // single miss — the grid stays put through a hiccup.
+            remoteFailStreak += 1
+            if remoteFailStreak >= 4 {
+                if ready { ready = false }
+                let s = "reconnecting to \(host)…"; if status != s { status = s }
+            }
+            return
+        }
+        remoteFailStreak = 0
+        // validate the key once against a gated endpoint so a wrong key is
+        // surfaced clearly instead of an empty grid
+        if h.authRequired, !remoteAuthValidated {
+            var areq = URLRequest(url: base.appendingPathComponent("api/status"))
+            areq.timeoutInterval = 8
+            if !apiKey.isEmpty { areq.setValue(apiKey, forHTTPHeaderField: "x-api-key") }
+            let code = (try? await controlSession.data(for: areq)).map { ($0.1 as? HTTPURLResponse)?.statusCode ?? 0 }
+            if code == 401 {
+                if ready { ready = false }
+                let s = "wrong key for \(host)"; if status != s { status = s }
+                return
+            }
+            if code == 200 { remoteAuthValidated = true }
+        }
+        if h.ready != ready { ready = h.ready }
+        let s = h.ready ? "connected · \(host)" : "\(host): indexing the card…"
+        if status != s { status = s }
+        startError = nil
     }
 
     // MARK: - polling

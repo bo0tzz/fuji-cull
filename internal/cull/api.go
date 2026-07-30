@@ -3,8 +3,10 @@ package cull
 import (
 	"context"
 	"os"
+	"strings"
 
 	"github.com/zack/fuji-tools/internal/photo"
+	"github.com/zack/fuji-tools/internal/pipeline"
 )
 
 // GUI-facing accessors: the native frontend runs in-process with the same
@@ -128,6 +130,59 @@ func (a *App) ImmichStates() string {
 // stale-buffer bug); a power cycle is the only remedy.
 func (a *App) CameraSick() (bulk, partial bool) { return a.prefetch.LinkSick() }
 
+// pipeline returns the import pipeline options under the lock. Settings can be
+// edited while the app runs, so this must not be read as a bare field.
+func (a *App) pipeline() pipeline.Options {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.pipelineOpts
+}
+
+// ImmichSettings reports the current credentials for display. `active` is
+// false when imports would be disk-only.
+func (a *App) ImmichSettings() (url, key, album string, stack, active bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	o := a.pipelineOpts
+	return o.ImmichURL, o.ImmichKey, a.album, o.ImmichStack, !o.SkipImmich
+}
+
+// SetImmich applies credentials entered in the app and persists them. Imports
+// pick them up immediately — the pipeline reads its options per run.
+//
+// The "already on the server" badge sweep is built once at startup, so
+// switching Immich ON here does not begin back-filling those badges until the
+// next launch; imports themselves work right away.
+func (a *App) SetImmich(url, key, album string, stack bool) {
+	url = strings.TrimRight(strings.TrimSpace(url), "/")
+	key = strings.TrimSpace(key)
+	a.mu.Lock()
+	a.pipelineOpts.ImmichURL = url
+	a.pipelineOpts.ImmichKey = key
+	a.pipelineOpts.ImmichStack = stack
+	// Credentials are what decide whether an import can upload at all.
+	a.pipelineOpts.SkipImmich = url == "" || key == ""
+	a.album = album
+	a.mu.Unlock()
+	saveImmichDefaults(url, key, album, stack)
+}
+
+// FocusBest reports which shots are the sharpest frame of their burst, keyed by
+// shot ID for direct lookup while drawing. Only bursts (2+ frames captured
+// within a couple of seconds) are ever marked — see Prefetcher.BurstBest for
+// why comparing focus scores across scenes would be meaningless.
+func (a *App) FocusBest() map[string]bool {
+	if !a.isReady() {
+		return nil
+	}
+	ids := a.prefetch.BurstBest()
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
 // CanStreamVideo reports whether the shot's video can play by streaming
 // straight off the camera (no full pull). False during imports — the import
 // owns the link for minutes and a stream session would fight it.
@@ -173,7 +228,7 @@ func (a *App) VideoPathIfReady(id string) (string, bool) {
 func (a *App) Defaults() (dest, album string) { return a.dest, a.album }
 
 // StartImport kicks off an import of keepers (same path the web UI uses).
-func (a *App) StartImport(dest, album string) error {
+func (a *App) StartImport(dest, album string, opt ImportOptions) error {
 	d, al := a.dest, a.album
 	if dest != "" {
 		d = dest
@@ -181,7 +236,7 @@ func (a *App) StartImport(dest, album string) error {
 	if album != "" {
 		al = album
 	}
-	return a.importer.Start(a, d, al)
+	return a.importer.Start(a, d, al, opt)
 }
 
 // ImportState returns the current import status snapshot.

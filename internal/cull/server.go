@@ -7,10 +7,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/zack/fuji-tools/internal/photo"
 	"github.com/zack/fuji-tools/internal/pipeline"
 )
 
@@ -32,12 +34,48 @@ type App struct {
 	dest         string
 	album        string
 
-	mu        sync.RWMutex
-	ready     bool
-	discStage string
-	discFiles int
-	discErr   string
-	camera    string // "X-H2S 21AQ00123" once discovery identified it
+	engineKey string // when set, /api/* requires this key (network exposure)
+
+	mu         sync.RWMutex
+	ready      bool
+	discStage  string
+	discFiles  int
+	discErr    string
+	camera     string // "X-H2S 21AQ00123" once discovery identified it
+	cameraSlug string // sanitized identity used as the sync namespace
+	sync       *syncer
+}
+
+// syncTarget returns the current session + sync slug under the lock. The session
+// pointer is swapped live at re-key, so the syncer must call this every cycle
+// rather than caching either value.
+func (a *App) syncTarget() (*Session, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.session, a.cameraSlug
+}
+
+// syncInfo is the /api/status.sync payload; nil when sync is not configured so
+// un-updated clients (which ignore the field) are unaffected.
+func (a *App) syncInfo() map[string]any {
+	a.mu.RLock()
+	sy, sess := a.sync, a.session
+	a.mu.RUnlock()
+	if sy == nil {
+		return nil
+	}
+	st := sy.status()
+	info := map[string]any{
+		"enabled":  true,
+		"lastOkMs": st.lastOkMs,
+		"error":    st.lastErr,
+	}
+	if sess != nil {
+		info["pending"] = len(sess.Outbox())
+		_, epoch, _ := sess.SyncMeta()
+		info["epoch"] = epoch
+	}
+	return info
 }
 
 func (a *App) setDiscovery(stage string, files int) {
@@ -58,6 +96,15 @@ func (a *App) finishInit(cat *Catalog, pf *Prefetcher) {
 	a.mu.Lock()
 	a.catalog = cat
 	a.prefetch = pf
+	sess := a.session
+	a.mu.Unlock()
+	// Install the canonical<->legacy bridges and re-project any records applied
+	// before discovery, so the legacy Decisions map is complete BEFORE clients
+	// can read it (ready flips below).
+	if sess != nil {
+		sess.SetResolvers(cat.Canonical, cat.Legacy)
+	}
+	a.mu.Lock()
 	a.ready = true
 	a.mu.Unlock()
 }
@@ -110,6 +157,8 @@ func (a *App) handler() http.Handler {
 	}
 	mux.Handle("GET /", http.FileServerFS(sub))
 
+	a.registerAuthRoutes(mux)
+
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		if !a.isReady() {
 			a.mu.RLock()
@@ -145,6 +194,7 @@ func (a *App) handler() http.Handler {
 			"decisions":   a.session.Decisions(),
 			"counts":      a.counts(),
 			"import":      a.importer.Status(),
+			"sync":        a.syncInfo(),
 		})
 	})
 
@@ -156,6 +206,7 @@ func (a *App) handler() http.Handler {
 			"fetch":     a.prefetch.Snapshot(),
 			"counts":    a.counts(),
 			"import":    a.importer.Status(),
+			"sync":      a.syncInfo(),
 			"bulkSick":  bulkSick,
 			"partSick":  partSick,
 			"streaming": a.prefetch.StreamingAvailable() && !a.importer.Status().Running,
@@ -165,10 +216,41 @@ func (a *App) handler() http.Handler {
 
 	mux.HandleFunc("GET /api/image", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
+		// max= asks for a downscaled copy sized to the client's screen: ~4x
+		// fewer bytes and a much cheaper decode, which is what makes buffering
+		// ahead keep up with a swipe. Any failure below falls through to the
+		// full frame, so this only ever costs speed, never the image.
+		size := 0
+		if v := r.URL.Query().Get("max"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				size = previewSize(n)
+			}
+		}
+		var shot *photo.Shot
+		if size > 0 {
+			shot = a.catalog.Get(id)
+			// A cached preview answers without waiting on the full frame —
+			// and so without touching the camera.
+			if shot != nil {
+				if hit := a.prefetch.CachedPreview(shot, size); hit != "" {
+					w.Header().Set("Cache-Control", "private, max-age=604800, immutable")
+					w.Header().Set("Content-Type", "image/jpeg")
+					http.ServeFile(w, r, hit)
+					return
+				}
+			}
+		}
 		path, err := a.prefetch.Wait(r.Context(), id)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+		if size > 0 && shot != nil {
+			if pp, err := a.prefetch.PreviewPath(shot, path, size); err == nil {
+				path = pp
+			} else {
+				log.Printf("preview: %s @%d: %v (serving full frame)", id, size, err)
+			}
 		}
 		// The bytes for a given shot never change: let the browser cache them
 		// so re-visiting a shot works even after the server evicts its copy.
@@ -281,6 +363,17 @@ func (a *App) handler() http.Handler {
 		states, have := a.prefetch.ThumbStates()
 		writeJSON(w, map[string]any{"states": states, "have": have,
 			"orient": a.prefetch.OrientStates(), "immich": a.ImmichStates()})
+	})
+
+	// Focus scores, separate from /api/thumbs because that one is polled hard
+	// while the thumbnail sweep runs and this map only creeps forward.
+	mux.HandleFunc("GET /api/sharpness", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{
+			"scores": a.prefetch.Sharpness(),
+			// the sharpest frame of each burst — the only focus comparison
+			// that means anything (see BurstBest)
+			"best": a.prefetch.BurstBest(),
+		})
 	})
 
 	mux.HandleFunc("POST /api/thumbhint", func(w http.ResponseWriter, r *http.Request) {
@@ -433,6 +526,10 @@ func (a *App) handler() http.Handler {
 		var req struct {
 			Dest  string `json:"dest"`
 			Album string `json:"album"`
+			// Optional, so existing clients keep today's behaviour: upload
+			// when Immich is configured, and keep the local copies.
+			Immich    *bool `json:"immich"`
+			KeepLocal *bool `json:"keepLocal"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -445,23 +542,35 @@ func (a *App) handler() http.Handler {
 		if req.Album != "" {
 			album = req.Album
 		}
-		if err := a.importer.Start(a, dest, album); err != nil {
+		_, _, _, _, immichActive := a.ImmichSettings()
+		opt := ImportOptions{Immich: immichActive, KeepLocal: true}
+		if req.Immich != nil {
+			opt.Immich = *req.Immich
+		}
+		if req.KeepLocal != nil {
+			opt.KeepLocal = *req.KeepLocal
+		}
+		if err := a.importer.Start(a, dest, album, opt); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
-		log.Printf("import started: dest=%s album=%q", dest, album)
+		log.Printf("import started: dest=%s album=%q immich=%v keepLocal=%v",
+			dest, album, opt.Immich, opt.KeepLocal)
 		writeJSON(w, a.importer.Status())
 	})
 
 	// Until discovery finishes, only the UI itself and /api/state (which
 	// reports discovery progress) are served; other API calls 503.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	readiness := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !a.isReady() && strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/state" {
 			http.Error(w, "still discovering camera contents", http.StatusServiceUnavailable)
 			return
 		}
 		mux.ServeHTTP(w, r)
 	})
+	// Auth is the outermost layer: reject unauthorized /api/* before readiness
+	// or any handler runs. A no-op when no engine key is configured.
+	return a.withAuth(readiness)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

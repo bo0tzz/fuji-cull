@@ -11,6 +11,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -234,9 +235,27 @@ type ui struct {
 		prev string
 	}
 
-	full   *texCache // full-res textures
-	thumbs *texCache // strip thumbnails
-	texts  *texCache // rendered strings
+	full      *texCache       // full-res textures
+	peaks     *texCache       // focus-peaking overlays (built from the same frames)
+	thumbs    *texCache       // strip thumbnails
+	texts     *texCache       // rendered strings
+	peaking   bool            // focus-peaking overlay on/off (toggled with F)
+	focusBest map[string]bool // shots that won their burst on focus score
+
+	// settings panel editing state (see settings.go)
+	setURL, setKey, setAlbum string
+	setStack                 bool
+	setField                 int
+	setSaved                 bool
+	setOpenTs                uint32
+	setPrevMode              int      // where Esc returns to
+	cogRect                  sdl.Rect // header settings button, hit-tested on click
+	mouseX, mouseY           int32    // last cursor position, for hover feedback
+
+	// import panel choices: copying to disk and uploading are independent
+	impImmich   bool // upload this run
+	impKeep     bool // keep the local copies
+	immichReady bool // credentials configured, so uploading is possible
 
 	// viewer transform (CSS-pixel semantics like the web UI)
 	scale, tx, ty float64
@@ -259,7 +278,7 @@ type ui struct {
 	lastWinW    int32
 	lastWinH    int32
 
-	mode int // modeViewer | modeGrid | modeImport
+	mode int // modeViewer | modeGrid | modeImport | modeSettings
 
 	mpv        videoPlayer
 	glVideo    bool           // GL render path available (zero-copy hwdec)
@@ -298,6 +317,7 @@ const (
 	modeViewer = iota
 	modeGrid
 	modeImport
+	modeSettings
 )
 
 // All layout happens in physical drawable pixels. dpr is the drawable/window
@@ -370,6 +390,30 @@ type videoPlayer interface {
 
 type zoomMem struct{ scale, cx, cy, aspect float64 }
 
+// setupGUILogging tees the log to a file. A .app launched from Finder has no
+// terminal, so without this every camera and import diagnostic the engine
+// prints is discarded — which is exactly what you need after a failed import.
+func setupGUILogging(logPath string) {
+	if logPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		dir := filepath.Join(home, ".local", "share", "fuji-cull", "logs")
+		if os.MkdirAll(dir, 0o755) != nil {
+			return
+		}
+		logPath = filepath.Join(dir, fmt.Sprintf("fuji-cull-gui-%s.log",
+			time.Now().Format("20060102-150405")))
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.Printf("gui: logging to %s", logPath)
+}
+
 func main() {
 	var o cull.Options
 	flag.StringVar(&o.Listen, "listen", "127.0.0.1:8787", "HTTP listen address for the built-in web UI")
@@ -391,10 +435,15 @@ func main() {
 	flag.IntVar(&o.Retries, "retries", 3, "immich retries")
 	flag.IntVar(&o.UploadConc, "upload-concurrency", 4, "parallel uploads")
 	flag.IntVar(&o.HashConc, "hash-concurrency", 4, "parallel hashing")
+	flag.StringVar(&o.SyncURL, "sync-url", os.Getenv("FUJI_SYNC_URL"), "cross-device sync server URL (or env FUJI_SYNC_URL)")
+	flag.StringVar(&o.SyncKey, "sync-key", os.Getenv("FUJI_SYNC_KEY"), "cross-device sync API key (or env FUJI_SYNC_KEY)")
+	flag.StringVar(&o.EngineKey, "engine-key", os.Getenv("FUJI_ENGINE_KEY"), "require this key on /api/* to expose the engine on the LAN (or env FUJI_ENGINE_KEY)")
 	decodeAhead := flag.Int("decode-ahead", 28, "decoded frames to hold ahead of the cursor (~104 MB RAM each)")
 	decodeBehind := flag.Int("decode-behind", 8, "decoded frames to hold behind the cursor")
+	logPath := flag.String("log", "", "log file (default: ~/.local/share/fuji-cull/logs/fuji-cull-gui-<ts>.log)")
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	setupGUILogging(*logPath)
 	setupBundleEnv()
 
 	// Prefer native Wayland over XWayland: SDL's X11 driver hands out a GLX
@@ -488,7 +537,8 @@ func run(app *cull.App, apiBase string, decodeAhead, decodeBehind int) error {
 		app: app, apiBase: apiBase, ren: ren, win: win, fontPath: fontPath,
 		pool:        newDecodePool(app, workers),
 		decodeAhead: decodeAhead, decodeBehind: decodeBehind,
-		full: newTexCache(16),
+		full:  newTexCache(16),
+		peaks: newTexCache(8),
 		// Must exceed the worst-case visible thumb count (fullscreen grid on
 		// a 4K monitor ≈ 500 cells) — an undersized LRU evicts textures that
 		// are still on screen and the grid strobes as they cycle back in.
@@ -590,6 +640,7 @@ func (u *ui) frame() bool {
 			u.orients = u.app.Orientations()
 			u.immich = u.app.ImmichStates()
 			u.camBulkSick, u.camPartSick = u.app.CameraSick()
+			u.decisions = u.app.Decisions() // adopt cross-device synced decisions
 		}
 		u.updateWants()
 		// A 104 MB photo texture upload mid-playback stalls the render
@@ -608,6 +659,18 @@ func (u *ui) frame() bool {
 			u.drawHeader()
 			u.drawStrip()
 			u.drawImportPanel()
+		case modeSettings:
+			// keep whatever you opened it from underneath, so closing the
+			// panel puts you back exactly where you were
+			if u.setPrevMode == modeGrid {
+				u.drawGrid()
+				u.drawHeader()
+			} else {
+				u.drawViewer()
+				u.drawHeader()
+				u.drawStrip()
+			}
+			u.drawSettings()
 		default:
 			u.drawViewer()
 			u.drawHeader()
@@ -749,6 +812,13 @@ func (u *ui) drawViewer() {
 	}
 	u.ren.SetClipRect(&st)
 	u.ren.CopyF(te.tex, nil, &dst)
+	// Focus peaking shares the photo's exact dst rect, so the edges stay
+	// registered to the pixels underneath at any zoom or pan.
+	if u.peaking {
+		if pt := u.peakTex(s.ID); pt != nil {
+			u.ren.CopyF(pt.tex, nil, &dst)
+		}
+	}
 	u.ren.SetClipRect(nil)
 
 	// decision frame + badge
@@ -763,6 +833,14 @@ func (u *ui) drawViewer() {
 	}
 	if u.scale > u.fit+1e-4 {
 		u.text(u.font, fmt.Sprintf("%d%%", int(u.scale*100+0.5)), colAmber, st.X+st.W-70, st.Y+14, false)
+	}
+	// Sharpest frame of its burst. Only ever shown for a genuine burst, so it
+	// is a claim about comparable frames rather than a raw score.
+	if u.focusBest[s.ID] {
+		u.text(u.fontSm, "SHARPEST OF BURST", colKeep, st.X+18, st.Y+st.H-sc(30), false)
+	}
+	if u.peaking {
+		u.text(u.fontSm, "PEAKING", colAmber, st.X+st.W-sc(110), st.Y+st.H-sc(30), false)
 	}
 }
 
@@ -827,6 +905,7 @@ func (u *ui) zoomAt(px, py float64, newScale float64) {
 func (u *ui) drawHeader() {
 	w, _ := u.outSize()
 	u.fillRect(sdl.Rect{X: 0, Y: 0, W: w, H: sc(38)}, colPanel)
+	u.drawCog(w-sc(22), sc(19), sc(7))
 	s := u.shots[u.cursor]
 	u.text(u.font, fmt.Sprintf("%04d/%04d", u.cursor+1, len(u.shots)), colFG, sc(14), sc(10), false)
 	name := fmt.Sprintf("%s / %s", s.Folder, s.Base)
@@ -939,7 +1018,7 @@ func (u *ui) drawStrip() {
 			u.ren.DrawRect(&out)
 		}
 	}
-	u.text(u.fontSm, "A/D ←→ nav   W/K keep   S/X reject   E/C clear   U undo   G next   T grid   I import   L video   Z 1:1   Space pause   ,/. seek   Ctrl+Q quit", colDim, w/2, h-sc(16), true)
+	u.text(u.fontSm, "A/D ←→ nav   W/K keep   S/X reject   E/C clear   U undo   G next   T grid   I import   F peaking   L video   Z 1:1   Space pause   ,/. seek   ⌘, settings   Ctrl+Q quit", colDim, w/2, h-sc(16), true)
 }
 
 func coverSrc(tw, th, dw, dh int32) sdl.Rect {
@@ -1044,6 +1123,13 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 				u.importText(e.GetText())
 			}
 		}
+		if u.mode == modeSettings {
+			// same trick: the comma that opened the panel would otherwise be
+			// typed straight into the URL field
+			if e.Timestamp-u.setOpenTs > 20 {
+				u.settingsText(e.GetText())
+			}
+		}
 		return true
 	case *sdl.KeyboardEvent:
 		if e.Type != sdl.KEYDOWN || u.shots == nil {
@@ -1051,6 +1137,10 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 		}
 		if u.mode == modeImport {
 			u.importKey(e)
+			return true
+		}
+		if u.mode == modeSettings {
+			u.settingsKey(e)
 			return true
 		}
 		if u.mode == modeGrid {
@@ -1109,6 +1199,13 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 			u.decide("")
 		case sdl.K_u:
 			u.undoLast()
+		case sdl.K_f:
+			// Focus peaking. Overlays are full-frame bitmaps, so drop them on
+			// the way out rather than holding a second set per frame.
+			u.peaking = !u.peaking
+			if !u.peaking {
+				u.peaks.flush()
+			}
 		// Ctrl +/-/0: UI zoom (persisted)
 		case sdl.K_EQUALS, sdl.K_KP_PLUS:
 			if e.Keysym.Mod&sdl.KMOD_CTRL != 0 {
@@ -1136,6 +1233,9 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 		case sdl.K_i:
 			u.mode = modeImport
 			u.impOpenTs = e.Timestamp
+			_, _, _, _, u.immichReady = u.app.ImmichSettings()
+			u.impImmich = u.immichReady // upload by default when it's possible
+			u.impKeep = true            // never discard local copies unasked
 			sdl.StartTextInput()
 		case sdl.K_l:
 			s := u.shots[u.cursor]
@@ -1157,7 +1257,11 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 			delete(u.pool.done, s.ID)
 			u.pool.mu.Unlock()
 		case sdl.K_COMMA:
-			if u.mpv != nil && u.videoID != "" {
+			// Cmd+, is Preferences on macOS; bare comma stays video seek.
+			if e.Keysym.Mod&sdl.KMOD_GUI != 0 {
+				u.openSettings()
+				u.setOpenTs = e.Timestamp
+			} else if u.mpv != nil && u.videoID != "" {
 				u.mpv.Seek(-5)
 			}
 		case sdl.K_PERIOD:
@@ -1207,6 +1311,16 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 		if e.Button == sdl.BUTTON_LEFT && u.shots != nil {
 			if e.Type == sdl.MOUSEBUTTONDOWN {
 				mx, my := int32(float64(e.X)*dpr+0.5), int32(float64(e.Y)*dpr+0.5)
+				if ptIn(u.cogRect, mx, my) {
+					// clicking it again closes, like any toggle button
+					if u.mode == modeSettings {
+						u.mode = u.setPrevMode
+						sdl.StopTextInput()
+					} else {
+						u.openSettings()
+					}
+					return true
+				}
 				if u.mode == modeGrid {
 					if u.scrubHit(mx) {
 						u.scrubDrag = true
@@ -1250,6 +1364,7 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 			}
 		}
 	case *sdl.MouseMotionEvent:
+		u.mouseX, u.mouseY = int32(float64(e.X)*dpr+0.5), int32(float64(e.Y)*dpr+0.5)
 		if u.scrubDrag {
 			u.scrubTo(int32(float64(e.Y)*dpr + 0.5))
 			return true

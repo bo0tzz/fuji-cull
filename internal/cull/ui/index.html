@@ -355,6 +355,7 @@
       <span class="u" id="cUndecided">U 0</span>
     </span>
     <span class="camsick" id="camSick" title="the camera is replaying stale buffers instead of file data; a power cycle is the only fix"></span>
+    <span class="counter" id="syncBadge" title="cross-device sync" style="display:none"></span>
     <span class="counter" id="metaProg" title="metadata (orientation) coverage"></span>
     <span class="counter" id="thumbProg" title="thumbnail sweep progress"></span>
     <button class="grid-toggle" id="gridBtn">GRID</button>
@@ -366,6 +367,14 @@
     <div class="badge" id="badge"></div>
     <div class="zoomtag" id="zoomtag">100%</div>
     <div id="overlay"><div class="blink" id="ovMsg">BUFFERING</div><div class="err" id="ovErr"></div></div>
+
+    <div id="authOverlay" style="display:none;position:fixed;inset:0;z-index:1000;background:var(--bg,#0B0C0B);flex-direction:column;align-items:center;justify-content:center;gap:14px">
+      <div style="color:var(--amber,#FFB32E);font:600 15px/1.3 ui-monospace,monospace">this camera engine needs a key</div>
+      <input id="authKey" type="password" placeholder="engine key" autocomplete="off" autocapitalize="off" spellcheck="false"
+        style="width:min(360px,80vw);padding:10px 12px;background:#161815;border:1px solid #30352C;color:#ECE9E0;border-radius:8px;font:14px ui-monospace,monospace">
+      <button id="authGo" style="padding:10px 22px;background:var(--amber,#FFB32E);color:#0B0C0B;border:0;border-radius:8px;font:600 13px ui-monospace,monospace;cursor:pointer">CONNECT</button>
+      <div id="authErr" style="color:#FF5A3D;font:12px ui-monospace,monospace;min-height:14px"></div>
+    </div>
 
     <div id="importPanel">
       <div class="box">
@@ -854,7 +863,35 @@ if (debugOn) {
 }
 
 /* ── boot ─────────────────────────────────────────────────── */
+// When the engine is exposed on the LAN it requires a key. Establish an auth
+// cookie before the boot loop so every <img>/<video> tag authenticates. No-op
+// on a loopback engine (authRequired=false) or if a prior cookie still works.
+async function ensureAuth() {
+  let h;
+  try { h = await (await fetch("/api/health")).json(); } catch (e) { return; } // offline; boot loop copes
+  if (!h || !h.authRequired) return;
+  try { if ((await fetch("/api/status")).status !== 401) return; } catch (e) { return; } // cookie still valid
+  const ov = $("authOverlay"), inp = $("authKey"), go = $("authGo"), err = $("authErr");
+  ov.style.display = "flex"; inp.focus();
+  await new Promise(resolve => {
+    const submit = async () => {
+      err.textContent = "";
+      try {
+        const res = await fetch("/api/auth", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: inp.value }),
+        });
+        if (res.ok) { ov.style.display = "none"; resolve(); return; }
+        err.textContent = "invalid key";
+      } catch (e) { err.textContent = "connection failed"; }
+    };
+    go.onclick = submit;
+    inp.onkeydown = e => { if (e.key === "Enter") submit(); };
+  });
+}
+
 async function boot() {
+  await ensureAuth();
   // The server binds before camera discovery finishes: show live progress
   // until /api/state stops reporting `discovering`.
   let st = null;
@@ -1376,6 +1413,20 @@ function nextUndecided() {
   toast("no undecided shots left");
 }
 
+/* ── sync badge ───────────────────────────────────────────── */
+function updateSyncBadge(sync) {
+  const el = $("syncBadge");
+  if (!sync || !sync.enabled) { el.style.display = "none"; return; }
+  el.style.display = "";
+  if (sync.error) {
+    el.textContent = "SYNC ⚠"; el.title = "sync error: " + sync.error;
+  } else if (sync.pending > 0) {
+    el.textContent = "SYNC ↑" + sync.pending; el.title = sync.pending + " change(s) pending upload";
+  } else {
+    el.textContent = "SYNCED"; el.title = "in sync with the server";
+  }
+}
+
 /* ── status poll ──────────────────────────────────────────── */
 async function poll() {
   try {
@@ -1383,6 +1434,10 @@ async function poll() {
     fetchStates = st.fetch || {};
     importStatus = st.import || {};
     videoStreaming = !!st.streaming;
+    // Cross-device sync: the engine's decision map is authoritative (it folds in
+    // decisions pulled from other devices), so adopt it wholesale each poll.
+    if (st.decisions) decisions = st.decisions;
+    updateSyncBadge(st.sync);
     $("camSick").textContent = st.bulkSick ? "CAMERA SICK · POWER-CYCLE"
       : st.partSick ? "CAMERA PARTIAL-READS SICK · POWER-CYCLE" : "";
     decorate();

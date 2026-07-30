@@ -117,33 +117,49 @@ fun CullApp(
         // epoch changes on engine restart (settings save): rebuild everything
         key(epoch) {
             val engine = service?.engine
+            val remoteUrl = settings.remoteUrl.trim()
+            val remote = remoteUrl.isNotEmpty()
             var ready by remember { mutableStateOf(false) }
-            var status by remember { mutableStateOf("starting engine…") }
+            var status by remember { mutableStateOf(if (remote) "connecting…" else "starting engine…") }
             var logTail by remember { mutableStateOf("") }
             var showSettings by remember { mutableStateOf(false) }
 
-            LaunchedEffect(engine) {
+            LaunchedEffect(engine, remote) {
                 while (true) {
                     try {
-                        val err = service?.startError
-                        val e = service?.engine
-                        if (err != null) {
-                            status = "engine failed: " + err
-                        } else if (e != null) {
-                            // gomobile calls off the main thread
-                            val snap = withContext(Dispatchers.Default) {
-                                val r = e.ready()
-                                Triple(r, if (r) "ready" else e.discoveryStatus(), e.recentLog())
+                        if (remote) {
+                            // thin client of a camera host on the LAN
+                            val h = Api(remoteUrl, settings.remoteKey).health()
+                            if (h == null) {
+                                ready = false
+                                status = "reconnecting to $remoteUrl…"
+                            } else {
+                                ready = h.optBoolean("ready")
+                                status = if (ready) "connected · $remoteUrl" else "host: indexing the card…"
                             }
-                            ready = snap.first
-                            status = snap.second
-                            logTail = snap.third
+                        } else {
+                            val err = service?.startError
+                            val e = service?.engine
+                            if (err != null) {
+                                status = "engine failed: " + err
+                            } else if (e != null) {
+                                // gomobile calls off the main thread
+                                val snap = withContext(Dispatchers.Default) {
+                                    val r = e.ready()
+                                    Triple(r, if (r) "ready" else e.discoveryStatus(), e.recentLog())
+                                }
+                                ready = snap.first
+                                status = snap.second
+                                logTail = snap.third
+                            }
                         }
                     } catch (t: Throwable) {
                         status = "engine: ${t.message}"
                     }
-                    if (ready) break
-                    delay(700)
+                    // keep polling remotely to notice reconnects; stop once a
+                    // local engine is ready
+                    if (ready && !remote) break
+                    delay(if (remote) 1500 else 700)
                 }
             }
 
@@ -160,7 +176,7 @@ fun CullApp(
                     onLog = { showLog = true },
                     onRescan = { onRescan(); showSettings = false },
                 )
-                !ready || engine == null ->
+                !ready || (!remote && engine == null) ->
                     ConnectScreen(
                         status, usbDiag, logTail,
                         onSettings = { showSettings = true },
@@ -169,7 +185,9 @@ fun CullApp(
                 else -> {
                     // a fresh Api per recomposition would defeat Compose
                     // skipping for every composable that receives it
-                    val api = remember(engine) { Api(engine.port()) }
+                    val api = remember(engine, remoteUrl) {
+                        if (remote) Api(remoteUrl, settings.remoteKey) else Api(engine!!.port())
+                    }
                     CullScreen(
                         api, importDest, resumeTick, settings,
                         onSettings = { showSettings = true },
@@ -324,6 +342,10 @@ private fun SettingsScreen(
     var url by remember { mutableStateOf(initial.url) }
     var apiKey by remember { mutableStateOf(initial.key) }
     var stack by remember { mutableStateOf(initial.stack) }
+    var syncUrl by remember { mutableStateOf(initial.syncUrl) }
+    var syncKey by remember { mutableStateOf(initial.syncKey) }
+    var remoteUrl by remember { mutableStateOf(initial.remoteUrl) }
+    var remoteKey by remember { mutableStateOf(initial.remoteKey) }
 
     Column(
         Modifier.fillMaxSize().background(Color(0xFF0B0C0B)).safeDrawingPadding()
@@ -353,13 +375,45 @@ private fun SettingsScreen(
                 color = Color.White, modifier = Modifier.padding(start = 10.dp),
             )
         }
+        Text("cross-device sync", color = Amber, style = MaterialTheme.typography.titleMedium)
+        Text(
+            "sync keep/reject across devices via your self-hosted fuji-sync server; leave empty to disable",
+            color = Dim, style = MaterialTheme.typography.bodySmall,
+        )
+        OutlinedTextField(
+            value = syncUrl, onValueChange = { syncUrl = it },
+            label = { Text("sync server url") },
+            placeholder = { Text("https://sync.example.com") },
+            singleLine = true, modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = syncKey, onValueChange = { syncKey = it },
+            label = { Text("sync api key") },
+            singleLine = true, modifier = Modifier.fillMaxWidth(),
+        )
+        Text("camera source", color = Amber, style = MaterialTheme.typography.titleMedium)
+        Text(
+            "leave empty to use this phone's camera; set a URL to browse a camera plugged into another machine (that engine needs --engine-key)",
+            color = Dim, style = MaterialTheme.typography.bodySmall,
+        )
+        OutlinedTextField(
+            value = remoteUrl, onValueChange = { remoteUrl = it },
+            label = { Text("remote engine url") },
+            placeholder = { Text("http://192.168.1.50:8787") },
+            singleLine = true, modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = remoteKey, onValueChange = { remoteKey = it },
+            label = { Text("engine key") },
+            singleLine = true, modifier = Modifier.fillMaxWidth(),
+        )
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             if (onLog != null) {
                 TextButton(onClick = onLog) { Text("VIEW LOG", color = Dim) }
             }
             TextButton(onClick = onClose) { Text("CANCEL", color = Dim) }
             Button(onClick = {
-                onSave(initial.copy(url = url, key = apiKey, session = "", stack = stack))
+                onSave(initial.copy(url = url, key = apiKey, session = "", stack = stack, syncUrl = syncUrl, syncKey = syncKey, remoteUrl = remoteUrl, remoteKey = remoteKey))
             }) { Text("SAVE") }
         }
         if (onRescan != null) {
@@ -411,6 +465,13 @@ private fun CullScreen(
                 val st = api.status()
                 sick = st.optBoolean("bulkSick") || st.optBoolean("partSick")
                 enginePosters = st.optBoolean("posters")
+                // cross-device sync: adopt the engine's merged decision map so
+                // decisions made on other devices appear here (was loaded once).
+                st.optJSONObject("decisions")?.let { d ->
+                    val m = mutableMapOf<String, String>()
+                    for (k in d.keys()) m[k] = d.getString(k)
+                    decisions.value = m
+                }
                 val imp = st.getJSONObject("import")
                 if (imp.optBoolean("running")) {
                     importing = "importing ${imp.optInt("done")}/${imp.optInt("total")}"

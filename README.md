@@ -24,11 +24,54 @@ Keys: `←→` navigate · `K` keep · `X` reject · `C` clear · `U` undo ·
 `Z`/click 100% zoom · `G` next undecided · `L` load video · `R` retry ·
 `I` import.
 
+Immich credentials can also be entered in the app — `⌘,` (or the cog in the
+header) on macOS, Settings on iOS/Android — and are stored in
+`~/.local/share/fuji-cull/import-defaults.json` (mode `0600`). This matters on
+macOS: an app launched from Finder inherits no shell environment, so
+`IMMICH_URL`/`IMMICH_API_KEY` exported in your shell are invisible to it.
+
+**API key permissions.** Create the key in Immich with:
+
+| Permission | Needed for |
+| --- | --- |
+| `asset.upload` | always — the upload itself and the bulk-upload-check that detects shots already on the server |
+| `album.read`, `album.create`, `albumAsset.create` | only when importing into an album |
+| `stack.create` | only with RAF+JPG stacking enabled |
+
+An under-scoped key still saves fine and only fails at import time, so it is
+worth ticking these when you create it.
+
 Decisions persist per `--session`, so a disconnect or restart resumes where
 you left off. Use `--listen 0.0.0.0:8787` to cull from another device.
 `--backend dir --root <dir>` works against any local directory with
 `NNN_FUJI` folders (handy for testing); `--camera-root` overrides the
 `/SLOT 1/DCIM,/SLOT 2/DCIM` default if the camera exposes storage differently.
+
+### Remote camera host (browse from any device)
+
+Plugging the camera into the iPad or phone can be awkward. Instead, plug it
+into one machine (your desktop, or an always-on box) and browse/cull/import
+from anywhere on the LAN — the camera host does all the work, every other
+device is just a viewport.
+
+On the host, run the engine bound to the network **with a key** (required to
+expose it safely — leave it off and it stays loopback-only as before):
+
+```sh
+fuji-cull --listen 0.0.0.0:8787 --engine-key "$(openssl rand -hex 24)"
+# or env FUJI_ENGINE_KEY=…
+```
+
+Then connect from each device:
+
+- **Browser (any device):** open `http://<host>:8787` and enter the key once.
+- **iPad / Android:** Settings → *Camera source* → the host URL + key.
+
+The key authenticates every request; media is fetched with it too. This is a
+**LAN** feature — for access beyond a trusted network, front it with a TLS
+reverse proxy or a private network (Tailscale/WireGuard). It composes with
+cross-device sync but doesn't need it: thin clients share the one host engine,
+so they always see the same state.
 
 ## fuji-cull for iPad (iOS app)
 
@@ -86,6 +129,39 @@ cd ios && ./run-device.sh --bind    # build engine + app, install to your iPad
 
 Video playback uses [MPVKit](https://github.com/mpvkit/MPVKit) (mpv/FFmpeg,
 LGPL build).
+
+## Cross-device sync (fuji-sync)
+
+Start culling on one device and resume on another. Each client keeps a full
+local copy of its keep/reject decisions and syncs them, when online, through a
+small **self-hosted** relay you run — so no decision ever lives only on the
+server. Decisions are keyed per camera (model + serial), so the same card's
+progress follows you across the iPad, phone, desktop, and web UI.
+
+**Run the server** (Docker):
+
+```sh
+cd deploy/sync
+echo "SYNC_API_KEY=$(openssl rand -hex 32)" > .env      # a strong shared key
+docker compose up -d --build                            # listens on :8777
+```
+
+Put it behind your own TLS reverse proxy for anything beyond a trusted LAN — the
+API key is the only credential. (Or run the binary directly:
+`go run ./cmd/fuji-sync --api-key <key> --db ./sync.db`.)
+
+**Point each client at it:**
+
+- **Desktop:** `fuji-cull --sync-url https://sync.example.com --sync-key <key>`
+  (or `FUJI_SYNC_URL` / `FUJI_SYNC_KEY` env).
+- **iPad / Android:** Settings → *Cross-device sync* → server URL + key.
+- **Web:** it's served by the engine, so it uses whatever the engine process was
+  started with.
+
+Sync is entirely optional and inert until configured. It's offline-first (queues
+your decisions and retries forever), merges concurrent edits per photo by
+most-recent-wins with tombstones for clears, and never overwrites a genuine edit
+with an older one. Design notes: [`docs/sync-design.md`](docs/sync-design.md).
 
 ## fuji-import
 
