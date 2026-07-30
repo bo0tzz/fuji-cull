@@ -526,6 +526,10 @@ func (a *App) handler() http.Handler {
 		var req struct {
 			Dest  string `json:"dest"`
 			Album string `json:"album"`
+			// Optional, so existing clients keep today's behaviour: upload
+			// when Immich is configured, and keep the local copies.
+			Immich    *bool `json:"immich"`
+			KeepLocal *bool `json:"keepLocal"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -538,11 +542,20 @@ func (a *App) handler() http.Handler {
 		if req.Album != "" {
 			album = req.Album
 		}
-		if err := a.importer.Start(a, dest, album); err != nil {
+		_, _, _, _, immichActive := a.ImmichSettings()
+		opt := ImportOptions{Immich: immichActive, KeepLocal: true}
+		if req.Immich != nil {
+			opt.Immich = *req.Immich
+		}
+		if req.KeepLocal != nil {
+			opt.KeepLocal = *req.KeepLocal
+		}
+		if err := a.importer.Start(a, dest, album, opt); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
-		log.Printf("import started: dest=%s album=%q", dest, album)
+		log.Printf("import started: dest=%s album=%q immich=%v keepLocal=%v",
+			dest, album, opt.Immich, opt.KeepLocal)
 		writeJSON(w, a.importer.Status())
 	})
 

@@ -4,12 +4,17 @@ import (
 	"fmt"
 
 	"github.com/veandco/go-sdl2/sdl"
+
+	"github.com/zack/fuji-tools/internal/cull"
 )
 
 // Import panel: keeper summary, destination/album text fields, progress.
 func (u *ui) drawImportPanel() {
 	w, h := u.outSize()
-	pw, ph := sc(640), sc(330)
+	// Tall enough for the fields, both toggles AND the progress bar that
+	// appears once an import is running — the layout must not collapse at the
+	// exact moment you are watching it.
+	pw, ph := sc(640), sc(440)
 	box := sdl.Rect{X: (w - pw) / 2, Y: (h - ph) / 2, W: pw, H: ph}
 	u.fillRect(sdl.Rect{X: 0, Y: 0, W: w, H: h}, sdl.Color{R: 0, G: 0, B: 0, A: 180})
 	u.fillRect(box, colPanel)
@@ -53,20 +58,66 @@ func (u *ui) drawImportPanel() {
 	field("destination directory (Tab switches fields)", u.impDest, u.impField == 0)
 	field("immich album (optional)", u.impAlbum, u.impField == 1)
 
+	// Two switches, because "copy to disk" and "upload to Immich" are
+	// independent jobs and people want each on its own.
+	toggle := func(label string, on, active, disabled bool, note string) {
+		mark := "[ ] " + label
+		if on {
+			mark = "[x] " + label
+		}
+		c := colFG
+		if disabled {
+			c = colDim
+		} else if active {
+			c = colAmber
+		}
+		u.text(u.fontSm, mark, c, box.X+sc(24), y, false)
+		if note != "" {
+			u.text(u.fontSm, note, colDim, box.X+sc(300), y, false)
+		}
+		y += sc(22)
+	}
+	toggle("upload to Immich", u.impImmich, u.impField == 2, !u.immichReady,
+		map[bool]string{true: "", false: "no server configured (⌘,)"}[u.immichReady])
+	toggle("keep local copy", u.impKeep, u.impField == 3, false,
+		map[bool]string{true: "", false: "staged, then deleted once verified"}[u.impKeep])
+	y += sc(6)
+
 	st := u.app.ImportState()
 	if st.Running || st.Phase == "done" || st.Phase == "error" {
 		label := st.Phase
 		if !st.Running {
 			label += " — finished"
 		}
-		u.text(u.fontSm, fmt.Sprintf("%s   %d / %d", label, st.Done, st.Total), colAmber, box.X+sc(24), y, false)
+		// Copy and upload run at the same time, so each gets its own counter
+		// and its own bar — one number standing for both was unreadable.
+		uploading := u.impImmich && u.immichReady
+		bar := func(label string, done, total int, col sdl.Color) {
+			pct := 0
+			if total > 0 {
+				pct = done * 100 / total
+			}
+			u.text(u.fontSm, fmt.Sprintf("%-22s %d / %d  (%d%%)", label, done, total, pct),
+				colFG, box.X+sc(24), y, false)
+			y += sc(20)
+			track := sdl.Rect{X: box.X + sc(24), Y: y, W: pw - sc(48), H: sc(8)}
+			u.fillRect(track, colBG)
+			if total > 0 {
+				fill := track
+				fill.W = int32(float64(track.W) * float64(done) / float64(total))
+				u.fillRect(fill, col)
+			}
+			y += sc(18)
+		}
+		status := st.Phase
+		if !st.Running {
+			status += " — finished"
+		}
+		u.text(u.fontSm, status, colAmber, box.X+sc(24), y, false)
 		y += sc(22)
-		bar := sdl.Rect{X: box.X + sc(24), Y: y, W: pw - sc(48), H: sc(8)}
-		u.fillRect(bar, colBG)
-		if st.Total > 0 {
-			fill := bar
-			fill.W = int32(float64(bar.W) * float64(st.Done) / float64(st.Total))
-			u.fillRect(fill, colKeep)
+		bar("download from camera", st.Done, st.Total, colKeep)
+		if uploading {
+			bar("upload to Immich", st.Uploaded, st.Total, colImmich)
 		}
 		y += sc(20)
 		if st.Error != "" {
@@ -74,7 +125,7 @@ func (u *ui) drawImportPanel() {
 			y += sc(20)
 		}
 	}
-	u.text(u.fontSm, "Enter start import    Esc close", colDim, box.X+sc(24), box.Y+ph-sc(30), false)
+	u.text(u.fontSm, "Enter start import    Space toggle    Esc close", colDim, box.X+sc(24), box.Y+ph-sc(30), false)
 }
 
 func (u *ui) importKey(e *sdl.KeyboardEvent) {
@@ -83,12 +134,36 @@ func (u *ui) importKey(e *sdl.KeyboardEvent) {
 		u.mode = modeViewer
 		sdl.StopTextInput()
 	case sdl.K_TAB:
-		u.impField = 1 - u.impField
+		step := 1
+		if e.Keysym.Mod&sdl.KMOD_SHIFT != 0 {
+			step = 3
+		}
+		u.impField = (u.impField + step) % 4
+	case sdl.K_SPACE:
+		switch u.impField {
+		case 2:
+			if u.immichReady {
+				u.impImmich = !u.impImmich
+			}
+		case 3:
+			u.impKeep = !u.impKeep
+		}
 	case sdl.K_RETURN:
-		if err := u.app.StartImport(u.impDest, u.impAlbum); err != nil {
+		if err := u.app.StartImport(u.impDest, u.impAlbum,
+			cull.ImportOptions{Immich: u.impImmich && u.immichReady, KeepLocal: u.impKeep}); err != nil {
 			u.impError = err.Error()
 		} else {
 			u.impError = ""
+		}
+	case sdl.K_v:
+		// Cmd+V / Ctrl+V — destination paths get pasted too
+		if e.Keysym.Mod&(sdl.KMOD_GUI|sdl.KMOD_CTRL) != 0 {
+			switch u.impField {
+			case 0:
+				u.impDest += clipboardText()
+			case 1:
+				u.impAlbum += clipboardText()
+			}
 		}
 	case sdl.K_BACKSPACE:
 		f := &u.impDest
@@ -102,9 +177,13 @@ func (u *ui) importKey(e *sdl.KeyboardEvent) {
 }
 
 func (u *ui) importText(t string) {
-	if u.impField == 0 {
+	if sdl.GetModState()&(sdl.KMOD_GUI|sdl.KMOD_CTRL) != 0 {
+		return // the "v" of Cmd+V
+	}
+	switch u.impField {
+	case 0:
 		u.impDest += t
-	} else {
+	case 1:
 		u.impAlbum += t
 	}
 }

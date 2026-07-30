@@ -228,7 +228,7 @@ func (a *App) VideoPathIfReady(id string) (string, bool) {
 func (a *App) Defaults() (dest, album string) { return a.dest, a.album }
 
 // StartImport kicks off an import of keepers (same path the web UI uses).
-func (a *App) StartImport(dest, album string) error {
+func (a *App) StartImport(dest, album string, opt ImportOptions) error {
 	d, al := a.dest, a.album
 	if dest != "" {
 		d = dest
@@ -236,7 +236,7 @@ func (a *App) StartImport(dest, album string) error {
 	if album != "" {
 		al = album
 	}
-	return a.importer.Start(a, d, al)
+	return a.importer.Start(a, d, al, opt)
 }
 
 // ImportState returns the current import status snapshot.

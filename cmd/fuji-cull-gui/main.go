@@ -251,6 +251,11 @@ type ui struct {
 	cogRect                  sdl.Rect // header settings button, hit-tested on click
 	mouseX, mouseY           int32    // last cursor position, for hover feedback
 
+	// import panel choices: copying to disk and uploading are independent
+	impImmich   bool // upload this run
+	impKeep     bool // keep the local copies
+	immichReady bool // credentials configured, so uploading is possible
+
 	// viewer transform (CSS-pixel semantics like the web UI)
 	scale, tx, ty float64
 	fit           float64
@@ -1201,6 +1206,9 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 		case sdl.K_i:
 			u.mode = modeImport
 			u.impOpenTs = e.Timestamp
+			_, _, _, _, u.immichReady = u.app.ImmichSettings()
+			u.impImmich = u.immichReady // upload by default when it's possible
+			u.impKeep = true            // never discard local copies unasked
 			sdl.StartTextInput()
 		case sdl.K_l:
 			s := u.shots[u.cursor]
