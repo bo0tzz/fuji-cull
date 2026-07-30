@@ -234,9 +234,12 @@ type ui struct {
 		prev string
 	}
 
-	full   *texCache // full-res textures
-	thumbs *texCache // strip thumbnails
-	texts  *texCache // rendered strings
+	full      *texCache       // full-res textures
+	peaks     *texCache       // focus-peaking overlays (built from the same frames)
+	thumbs    *texCache       // strip thumbnails
+	texts     *texCache       // rendered strings
+	peaking   bool            // focus-peaking overlay on/off (toggled with F)
+	focusBest map[string]bool // shots that won their burst on focus score
 
 	// viewer transform (CSS-pixel semantics like the web UI)
 	scale, tx, ty float64
@@ -491,7 +494,8 @@ func run(app *cull.App, apiBase string, decodeAhead, decodeBehind int) error {
 		app: app, apiBase: apiBase, ren: ren, win: win, fontPath: fontPath,
 		pool:        newDecodePool(app, workers),
 		decodeAhead: decodeAhead, decodeBehind: decodeBehind,
-		full: newTexCache(16),
+		full:  newTexCache(16),
+		peaks: newTexCache(8),
 		// Must exceed the worst-case visible thumb count (fullscreen grid on
 		// a 4K monitor ≈ 500 cells) — an undersized LRU evicts textures that
 		// are still on screen and the grid strobes as they cycle back in.
@@ -753,6 +757,13 @@ func (u *ui) drawViewer() {
 	}
 	u.ren.SetClipRect(&st)
 	u.ren.CopyF(te.tex, nil, &dst)
+	// Focus peaking shares the photo's exact dst rect, so the edges stay
+	// registered to the pixels underneath at any zoom or pan.
+	if u.peaking {
+		if pt := u.peakTex(s.ID); pt != nil {
+			u.ren.CopyF(pt.tex, nil, &dst)
+		}
+	}
 	u.ren.SetClipRect(nil)
 
 	// decision frame + badge
@@ -767,6 +778,14 @@ func (u *ui) drawViewer() {
 	}
 	if u.scale > u.fit+1e-4 {
 		u.text(u.font, fmt.Sprintf("%d%%", int(u.scale*100+0.5)), colAmber, st.X+st.W-70, st.Y+14, false)
+	}
+	// Sharpest frame of its burst. Only ever shown for a genuine burst, so it
+	// is a claim about comparable frames rather than a raw score.
+	if u.focusBest[s.ID] {
+		u.text(u.fontSm, "SHARPEST OF BURST", colKeep, st.X+18, st.Y+st.H-sc(30), false)
+	}
+	if u.peaking {
+		u.text(u.fontSm, "PEAKING", colAmber, st.X+st.W-sc(110), st.Y+st.H-sc(30), false)
 	}
 }
 
@@ -1113,6 +1132,13 @@ func (u *ui) handleEvent(ev sdl.Event) bool {
 			u.decide("")
 		case sdl.K_u:
 			u.undoLast()
+		case sdl.K_f:
+			// Focus peaking. Overlays are full-frame bitmaps, so drop them on
+			// the way out rather than holding a second set per frame.
+			u.peaking = !u.peaking
+			if !u.peaking {
+				u.peaks.flush()
+			}
 		// Ctrl +/-/0: UI zoom (persisted)
 		case sdl.K_EQUALS, sdl.K_KP_PLUS:
 			if e.Keysym.Mod&sdl.KMOD_CTRL != 0 {
