@@ -448,7 +448,7 @@ struct GridView: View {
         }
         .sheet(isPresented: $showLog) { LogSheet(engine: engine) }
         .sheet(isPresented: $showImport) {
-            ImportView(model: model, defaultDest: store.settings.importDest, album: store.settings.album)
+            ImportView(model: model, dest: engine.importDest, album: store.settings.album)
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
     }
