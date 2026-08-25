@@ -13,6 +13,14 @@
       "tintColor": "#FFB32E",
       "versions": [
         {
+          "version": "1.8.99",
+          "date": "2026-08-25",
+          "localizedDescription": "See https://github.com/zackpollard/fuji-cull/releases/tag/v1.8.99",
+          "downloadURL": "https://github.com/zackpollard/fuji-cull/releases/download/v1.8.99/FujiCull.ipa",
+          "size": 16724498,
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "1.8.0",
           "date": "2026-08-04",
           "localizedDescription": "See https://github.com/zackpollard/fuji-cull/releases/tag/v1.8.0",
